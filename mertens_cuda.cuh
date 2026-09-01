@@ -643,7 +643,8 @@ public:
         }
 
         const int block_size = 256;
-        const int64 heavy_k_limit = 2048; // Terms with k <= 2048 have large loop counts -> run block-collaborative
+        // Dynamically scale heavy_k_limit with X so heavy terms are always parallelized by blocks
+        const int64 heavy_k_limit = std::max(2048LL, std::min(131072LL, static_cast<int64>(std::sqrt(static_cast<double>(X)) * 0.02)));
 
         // Combined Range Execution
         if (!odd_k_comb.empty()) {
