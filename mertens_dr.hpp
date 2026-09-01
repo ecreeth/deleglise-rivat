@@ -37,6 +37,18 @@ inline int64 isqrt(int64 n) noexcept {
 }
 
 /**
+ * Exact floor division: Uses double precision division when y <= 2^53,
+ * and falls back to 64-bit integer division when y > 2^53 (e.g. X >= 10^17).
+ */
+inline int64 fast_div(int64 y, double dy, int64 d) noexcept {
+    if (y > 9007199254740992LL) {
+        return y / d;
+    } else {
+        return static_cast<int64>(dy / static_cast<double>(d));
+    }
+}
+
+/**
  * High-performance odd-only linear sieve for Mobius and Mertens.
  * Uses direct int16_t flat table for M(n) (since |M(n)| < 32768 for all n <= 7.6 * 10^9, Hurst 2018).
  * Takes only 2 bytes per entry with direct LDRH single-cycle memory load.

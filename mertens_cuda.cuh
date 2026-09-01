@@ -89,11 +89,23 @@ namespace functors {
     struct S2Single4 { __device__ inline int64 operator()(int64 q) const { return q; } };
 }
 
+/**
+ * Exact floor division helper: Uses fast double precision when y <= 2^53,
+ * and falls back to exact 64-bit integer division when y > 2^53 (e.g. X >= 10^17).
+ */
+__device__ inline int64 fast_div(int64 y, double dy, int64 d) {
+    if (y > 9007199254740992LL) {
+        return y / d;
+    } else {
+        return static_cast<int64>(__ddiv_rn(dy, static_cast<double>(d)));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 1. Warp-Collaborative S2 Evaluators (32 threads in lockstep, zero divergence)
 // ---------------------------------------------------------------------------
 template <typename F>
-__device__ inline int64 run_s2_fast_warp(int64 j_start, int64 j_end, double dy, const int8_t* __restrict__ mu_ptr, F summand_fn, int lane_id) {
+__device__ inline int64 run_s2_fast_warp(int64 j_start, int64 j_end, int64 y, double dy, const int8_t* __restrict__ mu_ptr, F summand_fn, int lane_id) {
     if (j_start > j_end) return 0;
     int64 sum = 0;
 
@@ -106,7 +118,7 @@ __device__ inline int64 run_s2_fast_warp(int64 j_start, int64 j_end, double dy, 
         if (j % 2 != 0 && j % 3 != 0) {
             int8_t m = __ldg(mu_ptr + j);
             if (m != 0) {
-                int64 q = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(j)));
+                int64 q = fast_div(y, dy, j);
                 sum += static_cast<int64>(m) * summand_fn(q);
             }
         }
@@ -120,11 +132,11 @@ __device__ inline int64 run_s2_fast_warp(int64 j_start, int64 j_end, double dy, 
         int8_t m2 = __ldg(mu_ptr + j2);
 
         if (m1) {
-            int64 q1 = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(j1)));
+            int64 q1 = fast_div(y, dy, j1);
             sum += static_cast<int64>(m1) * summand_fn(q1);
         }
         if (m2) {
-            int64 q2 = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(j2)));
+            int64 q2 = fast_div(y, dy, j2);
             sum += static_cast<int64>(m2) * summand_fn(q2);
         }
     }
@@ -135,7 +147,7 @@ __device__ inline int64 run_s2_fast_warp(int64 j_start, int64 j_end, double dy, 
         if (j % 2 != 0 && j % 3 != 0) {
             int8_t m = __ldg(mu_ptr + j);
             if (m != 0) {
-                int64 q = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(j)));
+                int64 q = fast_div(y, dy, j);
                 sum += static_cast<int64>(m) * summand_fn(q);
             }
         }
@@ -151,14 +163,14 @@ __device__ inline int64 eval_s2_combined_warp(int64 y, int64 A, int64 B, const i
     int64 b2 = B / 2; int64 a2 = A / 2;
 
     int64 sum = 0;
-    sum += run_s2_fast_warp(1, b6, dy, mu_ptr, functors::S2Comb1{}, lane_id);
-    sum += run_s2_fast_warp(b6 + 1, a6, dy, mu_ptr, functors::S2Comb2{}, lane_id);
-    sum += run_s2_fast_warp(a6 + 1, b3, dy, mu_ptr, functors::S2Comb3{}, lane_id);
-    sum += run_s2_fast_warp(b3 + 1, a3, dy, mu_ptr, functors::S2Comb4{}, lane_id);
-    sum += run_s2_fast_warp(a3 + 1, b2, dy, mu_ptr, functors::S2Comb5{}, lane_id);
-    sum += run_s2_fast_warp(b2 + 1, a2, dy, mu_ptr, functors::S2Comb6{}, lane_id);
-    sum += run_s2_fast_warp(a2 + 1, B, dy, mu_ptr, functors::S2Comb7{}, lane_id);
-    sum += run_s2_fast_warp(B + 1, A, dy, mu_ptr, functors::S2Comb8{}, lane_id);
+    sum += run_s2_fast_warp(1, b6, y, dy, mu_ptr, functors::S2Comb1{}, lane_id);
+    sum += run_s2_fast_warp(b6 + 1, a6, y, dy, mu_ptr, functors::S2Comb2{}, lane_id);
+    sum += run_s2_fast_warp(a6 + 1, b3, y, dy, mu_ptr, functors::S2Comb3{}, lane_id);
+    sum += run_s2_fast_warp(b3 + 1, a3, y, dy, mu_ptr, functors::S2Comb4{}, lane_id);
+    sum += run_s2_fast_warp(a3 + 1, b2, y, dy, mu_ptr, functors::S2Comb5{}, lane_id);
+    sum += run_s2_fast_warp(b2 + 1, a2, y, dy, mu_ptr, functors::S2Comb6{}, lane_id);
+    sum += run_s2_fast_warp(a2 + 1, B, y, dy, mu_ptr, functors::S2Comb7{}, lane_id);
+    sum += run_s2_fast_warp(B + 1, A, y, dy, mu_ptr, functors::S2Comb8{}, lane_id);
     return sum;
 }
 
@@ -169,10 +181,10 @@ __device__ inline int64 eval_s2_single_warp(int64 y, int64 A, const int8_t* __re
     int64 a2 = A / 2;
 
     int64 sum = 0;
-    sum += run_s2_fast_warp(1, a6, dy, mu_ptr, functors::S2Single1{}, lane_id);
-    sum += run_s2_fast_warp(a6 + 1, a3, dy, mu_ptr, functors::S2Single2{}, lane_id);
-    sum += run_s2_fast_warp(a3 + 1, a2, dy, mu_ptr, functors::S2Single3{}, lane_id);
-    sum += run_s2_fast_warp(a2 + 1, A, dy, mu_ptr, functors::S2Single4{}, lane_id);
+    sum += run_s2_fast_warp(1, a6, y, dy, mu_ptr, functors::S2Single1{}, lane_id);
+    sum += run_s2_fast_warp(a6 + 1, a3, y, dy, mu_ptr, functors::S2Single2{}, lane_id);
+    sum += run_s2_fast_warp(a3 + 1, a2, y, dy, mu_ptr, functors::S2Single3{}, lane_id);
+    sum += run_s2_fast_warp(a2 + 1, A, y, dy, mu_ptr, functors::S2Single4{}, lane_id);
     return sum;
 }
 
@@ -180,7 +192,7 @@ __device__ inline int64 eval_s2_single_warp(int64 y, int64 A, const int8_t* __re
 // 2. Block-Collaborative S2 Evaluators (512 threads per block for top heavy k)
 // ---------------------------------------------------------------------------
 template <typename F>
-__device__ inline int64 run_s2_fast_block(int64 j_start, int64 j_end, double dy, const int8_t* __restrict__ mu_ptr, F summand_fn) {
+__device__ inline int64 run_s2_fast_block(int64 j_start, int64 j_end, int64 y, double dy, const int8_t* __restrict__ mu_ptr, F summand_fn) {
     if (j_start > j_end) return 0;
     int64 sum = 0;
 
@@ -193,7 +205,7 @@ __device__ inline int64 run_s2_fast_block(int64 j_start, int64 j_end, double dy,
         if (j % 2 != 0 && j % 3 != 0) {
             int8_t m = __ldg(mu_ptr + j);
             if (m != 0) {
-                int64 q = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(j)));
+                int64 q = fast_div(y, dy, j);
                 sum += static_cast<int64>(m) * summand_fn(q);
             }
         }
@@ -206,11 +218,11 @@ __device__ inline int64 run_s2_fast_block(int64 j_start, int64 j_end, double dy,
         int8_t m2 = __ldg(mu_ptr + j2);
 
         if (m1) {
-            int64 q1 = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(j1)));
+            int64 q1 = fast_div(y, dy, j1);
             sum += static_cast<int64>(m1) * summand_fn(q1);
         }
         if (m2) {
-            int64 q2 = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(j2)));
+            int64 q2 = fast_div(y, dy, j2);
             sum += static_cast<int64>(m2) * summand_fn(q2);
         }
     }
@@ -220,7 +232,7 @@ __device__ inline int64 run_s2_fast_block(int64 j_start, int64 j_end, double dy,
         if (j % 2 != 0 && j % 3 != 0) {
             int8_t m = __ldg(mu_ptr + j);
             if (m != 0) {
-                int64 q = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(j)));
+                int64 q = fast_div(y, dy, j);
                 sum += static_cast<int64>(m) * summand_fn(q);
             }
         }
@@ -236,14 +248,14 @@ __device__ inline int64 eval_s2_combined_block(int64 y, int64 A, int64 B, const 
     int64 b2 = B / 2; int64 a2 = A / 2;
 
     int64 sum = 0;
-    sum += run_s2_fast_block(1, b6, dy, mu_ptr, functors::S2Comb1{});
-    sum += run_s2_fast_block(b6 + 1, a6, dy, mu_ptr, functors::S2Comb2{});
-    sum += run_s2_fast_block(a6 + 1, b3, dy, mu_ptr, functors::S2Comb3{});
-    sum += run_s2_fast_block(b3 + 1, a3, dy, mu_ptr, functors::S2Comb4{});
-    sum += run_s2_fast_block(a3 + 1, b2, dy, mu_ptr, functors::S2Comb5{});
-    sum += run_s2_fast_block(b2 + 1, a2, dy, mu_ptr, functors::S2Comb6{});
-    sum += run_s2_fast_block(a2 + 1, B, dy, mu_ptr, functors::S2Comb7{});
-    sum += run_s2_fast_block(B + 1, A, dy, mu_ptr, functors::S2Comb8{});
+    sum += run_s2_fast_block(1, b6, y, dy, mu_ptr, functors::S2Comb1{});
+    sum += run_s2_fast_block(b6 + 1, a6, y, dy, mu_ptr, functors::S2Comb2{});
+    sum += run_s2_fast_block(a6 + 1, b3, y, dy, mu_ptr, functors::S2Comb3{});
+    sum += run_s2_fast_block(b3 + 1, a3, y, dy, mu_ptr, functors::S2Comb4{});
+    sum += run_s2_fast_block(a3 + 1, b2, y, dy, mu_ptr, functors::S2Comb5{});
+    sum += run_s2_fast_block(b2 + 1, a2, y, dy, mu_ptr, functors::S2Comb6{});
+    sum += run_s2_fast_block(a2 + 1, B, y, dy, mu_ptr, functors::S2Comb7{});
+    sum += run_s2_fast_block(B + 1, A, y, dy, mu_ptr, functors::S2Comb8{});
     return sum;
 }
 
@@ -254,10 +266,10 @@ __device__ inline int64 eval_s2_single_block(int64 y, int64 A, const int8_t* __r
     int64 a2 = A / 2;
 
     int64 sum = 0;
-    sum += run_s2_fast_block(1, a6, dy, mu_ptr, functors::S2Single1{});
-    sum += run_s2_fast_block(a6 + 1, a3, dy, mu_ptr, functors::S2Single2{});
-    sum += run_s2_fast_block(a3 + 1, a2, dy, mu_ptr, functors::S2Single3{});
-    sum += run_s2_fast_block(a2 + 1, A, dy, mu_ptr, functors::S2Single4{});
+    sum += run_s2_fast_block(1, a6, y, dy, mu_ptr, functors::S2Single1{});
+    sum += run_s2_fast_block(a6 + 1, a3, y, dy, mu_ptr, functors::S2Single2{});
+    sum += run_s2_fast_block(a3 + 1, a2, y, dy, mu_ptr, functors::S2Single3{});
+    sum += run_s2_fast_block(a2 + 1, A, y, dy, mu_ptr, functors::S2Single4{});
     return sum;
 }
 
@@ -302,7 +314,7 @@ __global__ void eval_dr_combined_heavy_kernel(
         int64 n_stride = 2 * blockDim.x;
 
         for (int64 n = n_start; n <= kappa_y; n += n_stride) {
-            int64 q = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(n)));
+            int64 q = fast_div(y, dy, n);
             my_s1 += __ldg(d_M + q);
         }
 
@@ -311,7 +323,7 @@ __global__ void eval_dr_combined_heavy_kernel(
             if (start_even % 2 != 0) ++start_even;
             int64 ne_start = start_even + 2 * threadIdx.x;
             for (int64 ne = ne_start; ne <= two_kappa_y2; ne += n_stride) {
-                int64 q = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(ne)));
+                int64 q = fast_div(y, dy, ne);
                 my_s1 -= __ldg(d_M + q);
             }
         } else if (two_kappa_y2 < kappa_y) {
@@ -319,7 +331,7 @@ __global__ void eval_dr_combined_heavy_kernel(
             if (start_even % 2 != 0) ++start_even;
             int64 ne_start = start_even + 2 * threadIdx.x;
             for (int64 ne = ne_start; ne <= kappa_y; ne += n_stride) {
-                int64 q = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(ne)));
+                int64 q = fast_div(y, dy, ne);
                 my_s1 += __ldg(d_M + q);
             }
         }
@@ -363,7 +375,7 @@ __global__ void eval_dr_single_heavy_kernel(
         double dy = static_cast<double>(y);
 
         for (int64 n = start_n + threadIdx.x; n <= kappa_y; n += blockDim.x) {
-            int64 q = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(n)));
+            int64 q = fast_div(y, dy, n);
             my_s1 += __ldg(d_M + q);
         }
 
@@ -424,7 +436,7 @@ __global__ void eval_dr_combined_warp_kernel(
         int64 n_start = start_odd + 2 * lane_id;
 
         for (int64 n = n_start; n <= kappa_y; n += 64) {
-            int64 q = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(n)));
+            int64 q = fast_div(y, dy, n);
             my_s1 += __ldg(d_M + q);
         }
 
@@ -433,7 +445,7 @@ __global__ void eval_dr_combined_warp_kernel(
             if (start_even % 2 != 0) ++start_even;
             int64 ne_start = start_even + 2 * lane_id;
             for (int64 ne = ne_start; ne <= two_kappa_y2; ne += 64) {
-                int64 q = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(ne)));
+                int64 q = fast_div(y, dy, ne);
                 my_s1 -= __ldg(d_M + q);
             }
         } else if (two_kappa_y2 < kappa_y) {
@@ -441,7 +453,7 @@ __global__ void eval_dr_combined_warp_kernel(
             if (start_even % 2 != 0) ++start_even;
             int64 ne_start = start_even + 2 * lane_id;
             for (int64 ne = ne_start; ne <= kappa_y; ne += 64) {
-                int64 q = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(ne)));
+                int64 q = fast_div(y, dy, ne);
                 my_s1 += __ldg(d_M + q);
             }
         }
@@ -488,7 +500,7 @@ __global__ void eval_dr_single_warp_kernel(
         double dy = static_cast<double>(y);
 
         for (int64 n = start_n + lane_id; n <= kappa_y; n += 32) {
-            int64 q = static_cast<int64>(__ddiv_rn(dy, static_cast<double>(n)));
+            int64 q = fast_div(y, dy, n);
             my_s1 += __ldg(d_M + q);
         }
 
