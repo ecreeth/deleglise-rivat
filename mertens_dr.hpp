@@ -128,6 +128,12 @@ private:
             }
         }
 
+        // Free sieve temporary buffers immediately before expanding full table
+        primes.clear();
+        primes.shrink_to_fit();
+        is_prime.clear();
+        is_prime.shrink_to_fit();
+
         // Expand mu table for all n <= u in parallel
         int8_t* __restrict__ mu_full_ptr = mu.data();
         #pragma omp parallel for schedule(static) num_threads(threads)

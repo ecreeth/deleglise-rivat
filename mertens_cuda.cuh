@@ -545,8 +545,8 @@ public:
         int64 S = mertens_dr::isqrt(X);
         if (u < 3 * S) u = 3 * S;
 
-        // Scale u comfortably up to 2.5 Billion (~5.0 GB VRAM table) to utilize GPU memory
-        return std::min(u, 2500000000LL);
+        // Cap u safely at 1.4 Billion (~2.8 GB table) to stay well within 12.7 GB Host System RAM
+        return std::min(u, 1400000000LL);
     }
 
     /**
