@@ -49,7 +49,7 @@ inline int64 fast_div(int64 y, double dy, int64 d) noexcept {
 }
 
 /**
- * High-performance odd-only linear sieve for Mobius and Mertens.
+ * High-performance parallel segmented sieve for Mobius and Mertens.
  * Uses direct int16_t flat table for M(n) (since |M(n)| < 32768 for all n <= 7.6 * 10^9, Hurst 2018).
  * Takes only 2 bytes per entry with direct LDRH single-cycle memory load.
  */
@@ -93,50 +93,82 @@ public:
 private:
     void build_sieve(int threads) {
         int64 half_u = (u + 1) / 2;
-        std::vector<int8_t> mu_odd(static_cast<size_t>(half_u + 1), 0);
-        std::vector<int> primes;
-        primes.reserve(static_cast<size_t>(u / 12));
-        std::vector<uint8_t> is_prime(static_cast<size_t>(half_u + 1), 1);
-        
-        int8_t* __restrict__ mu_odd_ptr = mu_odd.data();
-        uint8_t* __restrict__ is_prime_ptr = is_prime.data();
-        
-        mu_odd_ptr[0] = 0;
-        mu_odd_ptr[1] = 1;
 
-        for (int i = 2; 2 * i - 1 <= u; ++i) {
-            int num = 2 * i - 1;
-            if (is_prime_ptr[i]) {
-                primes.push_back(num);
-                mu_odd_ptr[i] = -1;
+        // 1. Base primes up to sqrt(u)
+        int sqrt_u = static_cast<int>(std::sqrt(static_cast<double>(u))) + 1;
+        std::vector<int> primes;
+        std::vector<uint8_t> is_p(sqrt_u + 1, 1);
+        for (int i = 2; i <= sqrt_u; ++i) {
+            if (is_p[i]) {
+                if (i > 2) primes.push_back(i);
+                for (int j = i * i; j <= sqrt_u; j += i) is_p[j] = 0;
             }
-            int8_t mu_i = mu_odd_ptr[i];
-            const size_t num_primes = primes.size();
-            const int* __restrict__ p_ptr = primes.data();
-            for (size_t j = 0; j < num_primes; ++j) {
-                int p = p_ptr[j];
-                int64 prod = static_cast<int64>(num) * p;
-                if (prod > u) break;
-                int idx = static_cast<int>((prod + 1) / 2);
-                is_prime_ptr[idx] = 0;
-                if (num % p == 0) {
-                    mu_odd_ptr[idx] = 0;
-                    break;
-                } else {
-                    mu_odd_ptr[idx] = -mu_i;
+        }
+
+        // 2. Parallel segmented sieve over odd numbers
+        std::vector<int8_t> mu_odd(static_cast<size_t>(half_u + 1), 1);
+        mu_odd[0] = 0;
+
+        const int64 BLOCK_SIZE = 131072; // 128K entries fits in L2 cache
+        int64 num_blocks = (half_u + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        #pragma omp parallel num_threads(threads)
+        {
+            std::vector<int32_t> rem(BLOCK_SIZE);
+            #pragma omp for schedule(dynamic, 4)
+            for (int64 b = 0; b < num_blocks; ++b) {
+                int64 low_idx = b * BLOCK_SIZE + 1;
+                int64 high_idx = std::min(half_u, (b + 1) * BLOCK_SIZE);
+                int64 len = high_idx - low_idx + 1;
+                if (len <= 0) continue;
+
+                for (int64 i = 0; i < len; ++i) {
+                    rem[i] = static_cast<int32_t>(2 * (low_idx + i) - 1);
+                }
+
+                int8_t* __restrict__ b_mu = &mu_odd[low_idx];
+
+                for (int p : primes) {
+                    int64 p2 = static_cast<int64>(p) * p;
+                    int64 low_val = 2 * low_idx - 1;
+
+                    int64 start_val = ((low_val + p - 1) / p) * p;
+                    if (start_val % 2 == 0) start_val += p;
+                    int64 start_i = (start_val - low_val) / 2;
+
+                    int64 start_sq_val = ((low_val + p2 - 1) / p2) * p2;
+                    if (start_sq_val % 2 == 0) start_sq_val += p2;
+                    int64 start_sq_i = (start_sq_val - low_val) / 2;
+
+                    for (int64 i = start_sq_i; i < len; i += p2) {
+                        b_mu[i] = 0;
+                    }
+
+                    for (int64 i = start_i; i < len; i += p) {
+                        if (b_mu[i] != 0) {
+                            b_mu[i] = -b_mu[i];
+                            rem[i] /= p;
+                            while (rem[i] % p == 0) {
+                                rem[i] /= p;
+                                b_mu[i] = 0;
+                            }
+                        }
+                    }
+                }
+
+                for (int64 i = 0; i < len; ++i) {
+                    if (b_mu[i] != 0 && rem[i] > 1) {
+                        b_mu[i] = -b_mu[i];
+                    }
                 }
             }
         }
 
-        // Free sieve temporary buffers immediately before expanding full table
-        primes.clear();
-        primes.shrink_to_fit();
-        is_prime.clear();
-        is_prime.shrink_to_fit();
+        // 3. Parallel expansion to full mu
+        int8_t* __restrict__ mu_ptr = mu.data();
+        const int8_t* __restrict__ mu_odd_ptr = mu_odd.data();
 
-        // Expand mu table for all n <= u in parallel
-        int8_t* __restrict__ mu_full_ptr = mu.data();
-        #pragma omp parallel for schedule(static) num_threads(threads)
+        #pragma omp parallel for schedule(static, 65536) num_threads(threads)
         for (int64 i = 1; i <= u; ++i) {
             int8_t m;
             if (i & 1) {
@@ -146,25 +178,81 @@ private:
             } else {
                 m = 0;
             }
-            mu_full_ptr[i] = m;
+            mu_ptr[i] = m;
         }
 
-        // Prefix sum for M table
+        // 4. Parallel prefix sum for M
         int16_t* __restrict__ M_ptr = M.data();
-        int32_t run_sum = 0;
-        for (int64 i = 1; i <= u; ++i) {
-            run_sum += mu_full_ptr[i];
-            M_ptr[i] = static_cast<int16_t>(run_sum);
+        int num_t = threads;
+        std::vector<int32_t> block_sums(num_t + 1, 0);
+
+        #pragma omp parallel num_threads(num_t)
+        {
+            int tid = omp_get_thread_num();
+            int64 chunk = (u + num_t - 1) / num_t;
+            int64 start = tid * chunk + 1;
+            int64 end = std::min(u, (tid + 1) * chunk);
+
+            int32_t local_sum = 0;
+            for (int64 i = start; i <= end; ++i) {
+                local_sum += mu_ptr[i];
+            }
+            block_sums[tid + 1] = local_sum;
+        }
+
+        for (int i = 1; i <= num_t; ++i) {
+            block_sums[i] += block_sums[i - 1];
+        }
+
+        #pragma omp parallel num_threads(num_t)
+        {
+            int tid = omp_get_thread_num();
+            int64 chunk = (u + num_t - 1) / num_t;
+            int64 start = tid * chunk + 1;
+            int64 end = std::min(u, (tid + 1) * chunk);
+
+            int32_t run_sum = block_sums[tid];
+            for (int64 i = start; i <= end; ++i) {
+                run_sum += mu_ptr[i];
+                M_ptr[i] = static_cast<int16_t>(run_sum);
+            }
         }
     }
 };
 
+// ---------------------------------------------------------------------------
+// LUT Lookup Tables for S2 Piecewise Reduction (Zero Integer Div / Mod)
+// ---------------------------------------------------------------------------
+alignas(16) static constexpr int8_t LUT_P1[12] = {0, 1, 0, 0, 0, 1, 1, 2, 2, 2, 1, 2};
+alignas(16) static constexpr int8_t LUT_P2[12] = {0, 1, 0, 0, 0, 1, 1, 2, 2, 2, 1, 2};
+alignas(16) static constexpr int8_t LUT_P3[12] = {0, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1};
+alignas(16) static constexpr int8_t LUT_P4[12] = {0, 1, 0, 0, 0, 1, -1, 0, 0, 0, -1, 0};
+alignas(16) static constexpr int8_t LUT_P5[12] = {0, 1, 0, 1, 1, 2, 1, 2, 2, 3, 2, 3};
+alignas(16) static constexpr int8_t LUT_P7[12] = {0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6};
+
+alignas(16) static constexpr int8_t LUT_S1[12] = {0, 1, 1, 1, 1, 2, 2, 3, 3, 3, 3, 4};
+alignas(16) static constexpr int8_t LUT_S2[12] = {0, 1, 1, 1, 1, 2, 1, 2, 2, 2, 2, 3};
+alignas(16) static constexpr int8_t LUT_S3[12] = {0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6};
+
+struct Piece1 { static inline int64 eval(int64 q) noexcept { int64 k = q / 12; int64 r = q % 12; return 2 * k + LUT_P1[r]; } };
+struct Piece2 { static inline int64 eval(int64 q) noexcept { int64 k = q / 12; int64 r = q % 12; return 3 * k + LUT_P2[r]; } };
+struct Piece3 { static inline int64 eval(int64 q) noexcept { int64 k = q / 12; int64 r = q % 12; return 1 * k + LUT_P3[r]; } };
+struct Piece4 { static inline int64 eval(int64 q) noexcept { int64 k = q / 12; int64 r = q % 12; return -1 * k + LUT_P4[r]; } };
+struct Piece5 { static inline int64 eval(int64 q) noexcept { return (q >> 2) + (q & 1); } };
+struct Piece6 { static inline int64 eval(int64 q) noexcept { return (q & 1); } };
+struct Piece7 { static inline int64 eval(int64 q) noexcept { return (q + 1) >> 1; } };
+struct Piece8 { static inline int64 eval(int64 q) noexcept { return q; } };
+
+struct SinglePiece1 { static inline int64 eval(int64 q) noexcept { int64 k = q / 12; int64 r = q % 12; return 4 * k + LUT_S1[r]; } };
+struct SinglePiece2 { static inline int64 eval(int64 q) noexcept { int64 k = q / 12; int64 r = q % 12; return 2 * k + LUT_S2[r]; } };
+struct SinglePiece3 { static inline int64 eval(int64 q) noexcept { return (q + 1) >> 1; } };
+struct SinglePiece4 { static inline int64 eval(int64 q) noexcept { return q; } };
+
 /**
- * Branchless, Modulo-Free, NEON-Vectorized S2 Interval Runner.
- * Processes 2 mod-6 pairs per iteration (4 values: j1, j2, j3, j4) with parallel double division.
+ * Branchless, Modulo-Free, NEON-Vectorized S2 Interval Runner with LUT Summand.
  */
-template <typename F>
-inline int64 run_s2_fast(int64 j_start, int64 j_end, double dy, const int8_t* __restrict mu_ptr, F&& summand_fn) noexcept {
+template <typename PieceType>
+inline int64 run_s2_fast(int64 j_start, int64 j_end, double dy, const int8_t* __restrict mu_ptr) noexcept {
     if (j_start > j_end) return 0;
     int64 sum = 0;
 
@@ -178,7 +266,7 @@ inline int64 run_s2_fast(int64 j_start, int64 j_end, double dy, const int8_t* __
             int8_t m = mu_ptr[j];
             if (m != 0) {
                 int64 q = static_cast<int64>(dy / static_cast<double>(j));
-                sum += static_cast<int64>(m) * summand_fn(q);
+                sum += static_cast<int64>(m) * PieceType::eval(q);
             }
         }
     }
@@ -204,24 +292,24 @@ inline int64 run_s2_fast(int64 j_start, int64 j_end, double dy, const int8_t* __
             int64 q3 = static_cast<int64>(vgetq_lane_f64(v_qb, 0));
             int64 q4 = static_cast<int64>(vgetq_lane_f64(v_qb, 1));
 
-            if (m1) sum += static_cast<int64>(m1) * summand_fn(q1);
-            if (m2) sum += static_cast<int64>(m2) * summand_fn(q2);
-            if (m3) sum += static_cast<int64>(m3) * summand_fn(q3);
-            if (m4) sum += static_cast<int64>(m4) * summand_fn(q4);
+            if (m1) sum += static_cast<int64>(m1) * PieceType::eval(q1);
+            if (m2) sum += static_cast<int64>(m2) * PieceType::eval(q2);
+            if (m3) sum += static_cast<int64>(m3) * PieceType::eval(q3);
+            if (m4) sum += static_cast<int64>(m4) * PieceType::eval(q4);
         }
     }
     for (; m < m_end; ++m) {
         int64 j1 = 6 * m + 1; int64 j2 = 6 * m + 5;
         int8_t m1 = mu_ptr[j1]; int8_t m2 = mu_ptr[j2];
-        if (m1) sum += static_cast<int64>(m1) * summand_fn(static_cast<int64>(dy / static_cast<double>(j1)));
-        if (m2) sum += static_cast<int64>(m2) * summand_fn(static_cast<int64>(dy / static_cast<double>(j2)));
+        if (m1) sum += static_cast<int64>(m1) * PieceType::eval(static_cast<int64>(dy / static_cast<double>(j1)));
+        if (m2) sum += static_cast<int64>(m2) * PieceType::eval(static_cast<int64>(dy / static_cast<double>(j2)));
     }
 #else
     for (int64 m = m_start; m < m_end; ++m) {
         int64 j1 = 6 * m + 1; int64 j2 = 6 * m + 5;
         int8_t m1 = mu_ptr[j1]; int8_t m2 = mu_ptr[j2];
-        if (m1) sum += static_cast<int64>(m1) * summand_fn(static_cast<int64>(dy / static_cast<double>(j1)));
-        if (m2) sum += static_cast<int64>(m2) * summand_fn(static_cast<int64>(dy / static_cast<double>(j2)));
+        if (m1) sum += static_cast<int64>(m1) * PieceType::eval(static_cast<int64>(dy / static_cast<double>(j1)));
+        if (m2) sum += static_cast<int64>(m2) * PieceType::eval(static_cast<int64>(dy / static_cast<double>(j2)));
     }
 #endif
 
@@ -232,7 +320,7 @@ inline int64 run_s2_fast(int64 j_start, int64 j_end, double dy, const int8_t* __
             int8_t m = mu_ptr[j];
             if (m != 0) {
                 int64 q = static_cast<int64>(dy / static_cast<double>(j));
-                sum += static_cast<int64>(m) * summand_fn(q);
+                sum += static_cast<int64>(m) * PieceType::eval(q);
             }
         }
     }
@@ -253,46 +341,14 @@ inline int64 eval_s2_combined(int64 y, int64 A, int64 B, const int8_t* __restric
     int64 a2 = A / 2;
 
     int64 sum = 0;
-
-    // Piece 1: 1 <= j <= b6
-    sum += run_s2_fast(1, b6, dy, mu_ptr, [](int64 q) noexcept {
-        return (q / 4) + (q & 1) - (q / 12) - ((q / 3) & 1);
-    });
-
-    // Piece 2: b6 < j <= a6
-    sum += run_s2_fast(b6 + 1, a6, dy, mu_ptr, [](int64 q) noexcept {
-        return (q / 4) + (q & 1) - ((q % 6 >= 3) ? 1 : 0);
-    });
-
-    // Piece 3: a6 < j <= b3
-    sum += run_s2_fast(a6 + 1, b3, dy, mu_ptr, [](int64 q) noexcept {
-        return (q / 4) + (q & 1) - ((q + 3) / 6);
-    });
-
-    // Piece 4: b3 < j <= a3
-    sum += run_s2_fast(b3 + 1, a3, dy, mu_ptr, [](int64 q) noexcept {
-        return (q / 4) + (q & 1) - (q / 3);
-    });
-
-    // Piece 5: a3 < j <= b2
-    sum += run_s2_fast(a3 + 1, b2, dy, mu_ptr, [](int64 q) noexcept {
-        return (q / 4) + (q & 1);
-    });
-
-    // Piece 6: b2 < j <= a2
-    sum += run_s2_fast(b2 + 1, a2, dy, mu_ptr, [](int64 q) noexcept {
-        return (q & 1);
-    });
-
-    // Piece 7: a2 < j <= B
-    sum += run_s2_fast(a2 + 1, B, dy, mu_ptr, [](int64 q) noexcept {
-        return (q + 1) / 2;
-    });
-
-    // Piece 8: B < j <= A
-    sum += run_s2_fast(B + 1, A, dy, mu_ptr, [](int64 q) noexcept {
-        return q;
-    });
+    sum += run_s2_fast<Piece1>(1, b6, dy, mu_ptr);
+    sum += run_s2_fast<Piece2>(b6 + 1, a6, dy, mu_ptr);
+    sum += run_s2_fast<Piece3>(a6 + 1, b3, dy, mu_ptr);
+    sum += run_s2_fast<Piece4>(b3 + 1, a3, dy, mu_ptr);
+    sum += run_s2_fast<Piece5>(a3 + 1, b2, dy, mu_ptr);
+    sum += run_s2_fast<Piece6>(b2 + 1, a2, dy, mu_ptr);
+    sum += run_s2_fast<Piece7>(a2 + 1, B, dy, mu_ptr);
+    sum += run_s2_fast<Piece8>(B + 1, A, dy, mu_ptr);
 
     return sum;
 }
@@ -307,19 +363,10 @@ inline int64 eval_s2_single(int64 y, int64 A, const int8_t* __restrict mu_ptr) n
     int64 a2 = A / 2;
 
     int64 sum = 0;
-
-    sum += run_s2_fast(1, a6, dy, mu_ptr, [](int64 q) noexcept {
-        return (((q + 1) / 2) - (((q / 3) + 1) / 2));
-    });
-    sum += run_s2_fast(a6 + 1, a3, dy, mu_ptr, [](int64 q) noexcept {
-        return (((q + 1) / 2) - (q / 3));
-    });
-    sum += run_s2_fast(a3 + 1, a2, dy, mu_ptr, [](int64 q) noexcept {
-        return ((q + 1) / 2);
-    });
-    sum += run_s2_fast(a2 + 1, A, dy, mu_ptr, [](int64 q) noexcept {
-        return q;
-    });
+    sum += run_s2_fast<SinglePiece1>(1, a6, dy, mu_ptr);
+    sum += run_s2_fast<SinglePiece2>(a6 + 1, a3, dy, mu_ptr);
+    sum += run_s2_fast<SinglePiece3>(a3 + 1, a2, dy, mu_ptr);
+    sum += run_s2_fast<SinglePiece4>(a2 + 1, A, dy, mu_ptr);
 
     return sum;
 }
@@ -330,6 +377,15 @@ inline int64 eval_s2_single(int64 y, int64 A, const int8_t* __restrict mu_ptr) n
 class DelégliseRivatEngine {
 public:
     /**
+     * Dynamically chooses optimal balance parameter cx based on hardware SIMD and memory characteristics.
+     */
+    static inline double choose_cx(int64 X) noexcept {
+        if (X >= 1000000000000000LL) return 1.15;
+        if (X >= 10000000000000LL) return 0.95;
+        return 0.70;
+    }
+
+    /**
      * Dynamically chooses optimal sieve cutoff u for target X.
      */
     static inline int64 choose_sieve_limit(int64 X, int threads) {
@@ -339,17 +395,17 @@ public:
         }
 
         double loglogX = std::log(std::max(2.0, std::log(static_cast<double>(X))));
-        double fx = 0.85;
+        double fx = 0.95;
         if (X >= 1000000000000000LL) {
-            fx = 1.05;
+            fx = 1.25;
         }
 
         int64 u = static_cast<int64>(fx * std::pow(static_cast<double>(X) / loglogX, 2.0 / 3.0));
         int64 S = isqrt(X);
         if (u < 3 * S) u = 3 * S;
         
-        // Cap u at 450 Million (~900 MB RAM) for optimal multi-core cache throughput
-        return std::min(u, 450000000LL);
+        // Cap u at 600 Million (~1.2 GB RAM) for maximum multi-core cache throughput
+        return std::min(u, 600000000LL);
     }
 
     /**
@@ -408,7 +464,7 @@ public:
             return table.get_M(X);
         }
 
-        const double cx = 0.70; // Optimal balance for superscalar SIMD pipelines
+        const double cx = choose_cx(X); // Optimal balance for superscalar SIMD pipelines
         const int64 N = X / u;
         const int64 N_half = N / 2;
         const int16_t* __restrict M_ptr = table.data();
@@ -453,7 +509,7 @@ public:
             int64 kappa_y2 = y2 / (B + 1);
             int64 two_kappa_y2 = 2 * kappa_y2;
 
-            // 1. S1(y, u) - S1(y/2, u) via formula (6)
+            // 1. S1(y, u) - S1(y/2, u) with Dual-Level Software Prefetching
             int64 S1_diff = 0;
             int64 start_odd = (y / u + 1);
             if (start_odd % 2 == 0) ++start_odd;
@@ -463,7 +519,14 @@ public:
 
 #if defined(__ARM_NEON)
             float64x2_t v_dy = vdupq_n_f64(dy);
-            for (; n + 7 <= kappa_y; n += 8) {
+            for (; n + 15 <= kappa_y; n += 8) {
+                // Prefetch lookahead 16 steps ahead
+                int64 n_pref = n + 16;
+                int64 q_p0 = static_cast<int64>(dy / static_cast<double>(n_pref));
+                int64 q_p1 = static_cast<int64>(dy / static_cast<double>(n_pref + 4));
+                __builtin_prefetch(&M_ptr[q_p0], 0, 3);
+                __builtin_prefetch(&M_ptr[q_p1], 0, 3);
+
                 float64x2_t v_n1 = {static_cast<double>(n), static_cast<double>(n + 2)};
                 float64x2_t v_n2 = {static_cast<double>(n + 4), static_cast<double>(n + 6)};
                 float64x2_t v_q1 = vdivq_f64(v_dy, v_n1);
@@ -503,7 +566,7 @@ public:
                 }
             }
 
-            // 2. S2(y) - S2(y/2) mod 6 piecewise evaluation
+            // 2. S2(y) - S2(y/2) mod 6 piecewise evaluation via LUT
             int64 S2_diff = eval_s2_combined(y, A, B, mu_ptr);
 
             // S(y, u) - S(y/2, u)

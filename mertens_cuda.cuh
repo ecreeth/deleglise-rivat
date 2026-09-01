@@ -73,19 +73,27 @@ __device__ inline int64 block_reduce_sum(int64 val) {
     return val;
 }
 
+__constant__ int8_t d_LUT_P1[12] = {0, 1, 0, 0, 0, 1, 1, 2, 2, 2, 1, 2};
+__constant__ int8_t d_LUT_P2[12] = {0, 1, 0, 0, 0, 1, 1, 2, 2, 2, 1, 2};
+__constant__ int8_t d_LUT_P3[12] = {0, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1};
+__constant__ int8_t d_LUT_P4[12] = {0, 1, 0, 0, 0, 1, -1, 0, 0, 0, -1, 0};
+
+__constant__ int8_t d_LUT_S1[12] = {0, 1, 1, 1, 1, 2, 2, 3, 3, 3, 3, 4};
+__constant__ int8_t d_LUT_S2[12] = {0, 1, 1, 1, 1, 2, 1, 2, 2, 2, 2, 3};
+
 namespace functors {
-    struct S2Comb1 { __device__ inline int64 operator()(int64 q) const { return (q / 4) + (q & 1) - (q / 12) - ((q / 3) & 1); } };
-    struct S2Comb2 { __device__ inline int64 operator()(int64 q) const { return (q / 4) + (q & 1) - ((q % 6 >= 3) ? 1 : 0); } };
-    struct S2Comb3 { __device__ inline int64 operator()(int64 q) const { return (q / 4) + (q & 1) - ((q + 3) / 6); } };
-    struct S2Comb4 { __device__ inline int64 operator()(int64 q) const { return (q / 4) + (q & 1) - (q / 3); } };
-    struct S2Comb5 { __device__ inline int64 operator()(int64 q) const { return (q / 4) + (q & 1); } };
+    struct S2Comb1 { __device__ inline int64 operator()(int64 q) const { int64 k = q / 12; int64 r = q % 12; return 2 * k + d_LUT_P1[r]; } };
+    struct S2Comb2 { __device__ inline int64 operator()(int64 q) const { int64 k = q / 12; int64 r = q % 12; return 3 * k + d_LUT_P2[r]; } };
+    struct S2Comb3 { __device__ inline int64 operator()(int64 q) const { int64 k = q / 12; int64 r = q % 12; return 1 * k + d_LUT_P3[r]; } };
+    struct S2Comb4 { __device__ inline int64 operator()(int64 q) const { int64 k = q / 12; int64 r = q % 12; return -1 * k + d_LUT_P4[r]; } };
+    struct S2Comb5 { __device__ inline int64 operator()(int64 q) const { return (q >> 2) + (q & 1); } };
     struct S2Comb6 { __device__ inline int64 operator()(int64 q) const { return (q & 1); } };
-    struct S2Comb7 { __device__ inline int64 operator()(int64 q) const { return (q + 1) / 2; } };
+    struct S2Comb7 { __device__ inline int64 operator()(int64 q) const { return (q + 1) >> 1; } };
     struct S2Comb8 { __device__ inline int64 operator()(int64 q) const { return q; } };
 
-    struct S2Single1 { __device__ inline int64 operator()(int64 q) const { return (((q + 1) / 2) - (((q / 3) + 1) / 2)); } };
-    struct S2Single2 { __device__ inline int64 operator()(int64 q) const { return (((q + 1) / 2) - (q / 3)); } };
-    struct S2Single3 { __device__ inline int64 operator()(int64 q) const { return ((q + 1) / 2); } };
+    struct S2Single1 { __device__ inline int64 operator()(int64 q) const { int64 k = q / 12; int64 r = q % 12; return 4 * k + d_LUT_S1[r]; } };
+    struct S2Single2 { __device__ inline int64 operator()(int64 q) const { int64 k = q / 12; int64 r = q % 12; return 2 * k + d_LUT_S2[r]; } };
+    struct S2Single3 { __device__ inline int64 operator()(int64 q) const { return (q + 1) >> 1; } };
     struct S2Single4 { __device__ inline int64 operator()(int64 q) const { return q; } };
 }
 
@@ -576,7 +584,7 @@ public:
             return table.get_M(X);
         }
 
-        const double cx = 0.70;
+        const double cx = mertens_dr::DelégliseRivatEngine::choose_cx(X);
         const int64 N = X / u;
         const int64 N_half = N / 2;
         const int8_t* mu_ptr = table.mu.data();
