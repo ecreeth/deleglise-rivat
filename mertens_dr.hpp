@@ -83,51 +83,60 @@ private:
         int64 half_u = (u + 1) / 2;
         std::vector<int8_t> mu_odd(static_cast<size_t>(half_u + 1), 0);
         std::vector<int> primes;
-        primes.reserve(static_cast<size_t>(u / 10));
+        primes.reserve(static_cast<size_t>(u / 12));
         std::vector<uint8_t> is_prime(static_cast<size_t>(half_u + 1), 1);
-        mu_odd[0] = 0;
-        mu_odd[1] = 1;
+        
+        int8_t* __restrict__ mu_odd_ptr = mu_odd.data();
+        uint8_t* __restrict__ is_prime_ptr = is_prime.data();
+        
+        mu_odd_ptr[0] = 0;
+        mu_odd_ptr[1] = 1;
 
         for (int i = 2; 2 * i - 1 <= u; ++i) {
             int num = 2 * i - 1;
-            if (is_prime[i]) {
+            if (is_prime_ptr[i]) {
                 primes.push_back(num);
-                mu_odd[i] = -1;
+                mu_odd_ptr[i] = -1;
             }
-            for (size_t j = 0; j < primes.size(); ++j) {
-                int p = primes[j];
+            int8_t mu_i = mu_odd_ptr[i];
+            const size_t num_primes = primes.size();
+            const int* __restrict__ p_ptr = primes.data();
+            for (size_t j = 0; j < num_primes; ++j) {
+                int p = p_ptr[j];
                 int64 prod = static_cast<int64>(num) * p;
                 if (prod > u) break;
                 int idx = static_cast<int>((prod + 1) / 2);
-                is_prime[idx] = 0;
+                is_prime_ptr[idx] = 0;
                 if (num % p == 0) {
-                    mu_odd[idx] = 0;
+                    mu_odd_ptr[idx] = 0;
                     break;
                 } else {
-                    mu_odd[idx] = -mu_odd[i];
+                    mu_odd_ptr[idx] = -mu_i;
                 }
             }
         }
 
         // Expand mu table for all n <= u in parallel
+        int8_t* __restrict__ mu_full_ptr = mu.data();
         #pragma omp parallel for schedule(static) num_threads(threads)
         for (int64 i = 1; i <= u; ++i) {
             int8_t m;
-            if (i % 2 != 0) {
-                m = mu_odd[static_cast<size_t>((i + 1) / 2)];
-            } else if ((i / 2) % 2 != 0) {
-                m = -mu_odd[static_cast<size_t>(((i / 2) + 1) / 2)];
+            if (i & 1) {
+                m = mu_odd_ptr[(i + 1) >> 1];
+            } else if ((i >> 1) & 1) {
+                m = -mu_odd_ptr[((i >> 1) + 1) >> 1];
             } else {
                 m = 0;
             }
-            mu[i] = m;
+            mu_full_ptr[i] = m;
         }
 
-        // Fast prefix sum
+        // Prefix sum for M table
+        int16_t* __restrict__ M_ptr = M.data();
         int32_t run_sum = 0;
         for (int64 i = 1; i <= u; ++i) {
-            run_sum += mu[i];
-            M[i] = static_cast<int16_t>(run_sum);
+            run_sum += mu_full_ptr[i];
+            M_ptr[i] = static_cast<int16_t>(run_sum);
         }
     }
 };
