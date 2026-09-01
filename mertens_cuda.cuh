@@ -539,14 +539,14 @@ public:
         double loglogX = std::log(std::max(2.0, std::log(static_cast<double>(X))));
         double fx = 1.10;
         if (X >= 1000000000000000LL) fx = 1.45;
-        if (X >= 10000000000000000LL) fx = 1.80;
+        if (X >= 10000000000000000LL) fx = 2.20;
 
         int64 u = static_cast<int64>(fx * std::pow(static_cast<double>(X) / loglogX, 2.0 / 3.0));
         int64 S = mertens_dr::isqrt(X);
         if (u < 3 * S) u = 3 * S;
 
-        // Scale u up to 1.2 Billion (~2.4 GB VRAM table) to minimize outer loop count
-        return std::min(u, 1200000000LL);
+        // Scale u comfortably up to 2.5 Billion (~5.0 GB VRAM table) to utilize GPU memory
+        return std::min(u, 2500000000LL);
     }
 
     /**
@@ -598,6 +598,8 @@ public:
         }
 
         // 2. Allocate and copy to GPU
+        int64 mu_limit = std::min(u, std::max(N, static_cast<int64>(cx * std::sqrt(static_cast<double>(X)))) + 65536LL);
+
         int16_t* d_M = nullptr;
         int8_t* d_mu = nullptr;
         int64* d_odd_k_comb = nullptr;
@@ -605,7 +607,7 @@ public:
         int64* d_total_sum = nullptr;
 
         CUDA_CHECK(cudaMalloc(&d_M, (u + 1) * sizeof(int16_t)));
-        CUDA_CHECK(cudaMalloc(&d_mu, (u + 1) * sizeof(int8_t)));
+        CUDA_CHECK(cudaMalloc(&d_mu, (mu_limit + 1) * sizeof(int8_t)));
         CUDA_CHECK(cudaMalloc(&d_total_sum, sizeof(int64)));
 
         if (!odd_k_comb.empty()) {
@@ -619,7 +621,7 @@ public:
         auto t2 = std::chrono::high_resolution_clock::now();
         CUDA_CHECK(cudaMemcpy(d_total_sum, &zero_val, sizeof(int64), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_M, table.data(), (u + 1) * sizeof(int16_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_mu, table.mu.data(), (u + 1) * sizeof(int8_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mu, table.mu.data(), (mu_limit + 1) * sizeof(int8_t), cudaMemcpyHostToDevice));
 
         if (!odd_k_comb.empty()) {
             CUDA_CHECK(cudaMemcpy(d_odd_k_comb, odd_k_comb.data(), odd_k_comb.size() * sizeof(int64), cudaMemcpyHostToDevice));
