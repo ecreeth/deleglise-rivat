@@ -196,221 +196,84 @@ __device__ inline int64 eval_s2_single_warp(int64 y, int64 A, const int8_t* __re
     return sum;
 }
 
-// ---------------------------------------------------------------------------
-// 2. Block-Collaborative S2 Evaluators (512 threads per block for top heavy k)
-// ---------------------------------------------------------------------------
-template <typename F>
-__device__ inline int64 run_s2_fast_block(int64 j_start, int64 j_end, int64 y, double dy, const int8_t* __restrict__ mu_ptr, F summand_fn) {
-    if (j_start > j_end) return 0;
-    int64 sum = 0;
+__device__ inline int64 eval_comb2_device(int64 y, int64 y2, int64 u, double cx, const int16_t* __restrict__ d_M, const int8_t* __restrict__ d_mu, int lane_id) {
+    int64 A = static_cast<int64>(cx * sqrt(static_cast<double>(y)));
+    int64 B = static_cast<int64>(cx * sqrt(static_cast<double>(y2)));
+    if (A >= y) A = y - 1;
+    if (B >= y2) B = y2 - 1;
+    if (A < 1) A = 1;
+    if (B < 1) B = 1;
 
-    int64 m_start = (j_start + 5) / 6;
-    int64 m_end = j_end / 6;
+    int64 kappa_y = y / (A + 1);
+    int64 kappa_y2 = y2 / (B + 1);
+    int64 two_kappa_y2 = 2 * kappa_y2;
 
-    // Head Boundary
-    int64 head_end = (j_end < m_start * 6) ? j_end : (m_start * 6);
-    for (int64 j = j_start + threadIdx.x; j <= head_end; j += blockDim.x) {
-        if (j % 2 != 0 && j % 3 != 0) {
-            int8_t m = __ldg(mu_ptr + j);
-            if (m != 0) {
-                int64 q = fast_div(y, dy, j);
-                sum += static_cast<int64>(m) * summand_fn(q);
-            }
-        }
-    }
+    int64 my_s1 = 0;
+    int64 start_odd = (y / u + 1);
+    if (start_odd % 2 == 0) ++start_odd;
 
-    for (int64 m = m_start + threadIdx.x; m < m_end; m += blockDim.x) {
-        int64 j1 = 6 * m + 1;
-        int64 j2 = 6 * m + 5;
-        int8_t m1 = __ldg(mu_ptr + j1);
-        int8_t m2 = __ldg(mu_ptr + j2);
-
-        if (m1) {
-            int64 q1 = fast_div(y, dy, j1);
-            sum += static_cast<int64>(m1) * summand_fn(q1);
-        }
-        if (m2) {
-            int64 q2 = fast_div(y, dy, j2);
-            sum += static_cast<int64>(m2) * summand_fn(q2);
-        }
-    }
-
-    int64 tail_start = (j_start > m_end * 6 + 1) ? j_start : (m_end * 6 + 1);
-    for (int64 j = tail_start + threadIdx.x; j <= j_end; j += blockDim.x) {
-        if (j % 2 != 0 && j % 3 != 0) {
-            int8_t m = __ldg(mu_ptr + j);
-            if (m != 0) {
-                int64 q = fast_div(y, dy, j);
-                sum += static_cast<int64>(m) * summand_fn(q);
-            }
-        }
-    }
-
-    return sum;
-}
-
-__device__ inline int64 eval_s2_combined_block(int64 y, int64 A, int64 B, const int8_t* __restrict__ mu_ptr) {
     double dy = static_cast<double>(y);
-    int64 b6 = B / 6; int64 a6 = A / 6;
-    int64 b3 = B / 3; int64 a3 = A / 3;
-    int64 b2 = B / 2; int64 a2 = A / 2;
+    int64 n_start = start_odd + 2 * lane_id;
 
-    int64 sum = 0;
-    sum += run_s2_fast_block(1, b6, y, dy, mu_ptr, functors::S2Comb1{});
-    sum += run_s2_fast_block(b6 + 1, a6, y, dy, mu_ptr, functors::S2Comb2{});
-    sum += run_s2_fast_block(a6 + 1, b3, y, dy, mu_ptr, functors::S2Comb3{});
-    sum += run_s2_fast_block(b3 + 1, a3, y, dy, mu_ptr, functors::S2Comb4{});
-    sum += run_s2_fast_block(a3 + 1, b2, y, dy, mu_ptr, functors::S2Comb5{});
-    sum += run_s2_fast_block(b2 + 1, a2, y, dy, mu_ptr, functors::S2Comb6{});
-    sum += run_s2_fast_block(a2 + 1, B, y, dy, mu_ptr, functors::S2Comb7{});
-    sum += run_s2_fast_block(B + 1, A, y, dy, mu_ptr, functors::S2Comb8{});
-    return sum;
-}
+    for (int64 n = n_start; n <= kappa_y; n += 64) {
+        int64 q = fast_div(y, dy, n);
+        my_s1 += __ldg(d_M + q);
+    }
 
-__device__ inline int64 eval_s2_single_block(int64 y, int64 A, const int8_t* __restrict__ mu_ptr) {
-    double dy = static_cast<double>(y);
-    int64 a6 = A / 6;
-    int64 a3 = A / 3;
-    int64 a2 = A / 2;
-
-    int64 sum = 0;
-    sum += run_s2_fast_block(1, a6, y, dy, mu_ptr, functors::S2Single1{});
-    sum += run_s2_fast_block(a6 + 1, a3, y, dy, mu_ptr, functors::S2Single2{});
-    sum += run_s2_fast_block(a3 + 1, a2, y, dy, mu_ptr, functors::S2Single3{});
-    sum += run_s2_fast_block(a2 + 1, A, y, dy, mu_ptr, functors::S2Single4{});
-    return sum;
-}
-
-// ---------------------------------------------------------------------------
-// 3. Heavy Kernels: 1 Dedicated Block per ultra-heavy k (512 threads)
-// ---------------------------------------------------------------------------
-__global__ void eval_dr_combined_heavy_kernel(
-    int64 X,
-    int64 u,
-    double cx,
-    const int64* __restrict__ d_odd_k,
-    int64 num_heavy_k,
-    const int16_t* __restrict__ d_M,
-    const int8_t* __restrict__ d_mu,
-    int64* __restrict__ d_total_sum
-) {
-    for (int64 k_idx = blockIdx.x; k_idx < num_heavy_k; k_idx += gridDim.x) {
-        int64 k = d_odd_k[k_idx];
-        int8_t mu_k = __ldg(d_mu + k);
-        if (mu_k == 0) continue;
-
-        int64 y = X / k;
-        int64 y2 = y / 2;
-
-        int64 A = static_cast<int64>(cx * sqrt(static_cast<double>(y)));
-        int64 B = static_cast<int64>(cx * sqrt(static_cast<double>(y2)));
-        if (A >= y) A = y - 1;
-        if (B >= y2) B = y2 - 1;
-        if (A < 1) A = 1;
-        if (B < 1) B = 1;
-
-        int64 kappa_y = y / (A + 1);
-        int64 kappa_y2 = y2 / (B + 1);
-        int64 two_kappa_y2 = 2 * kappa_y2;
-
-        int64 my_s1 = 0;
-        int64 start_odd = (y / u + 1);
-        if (start_odd % 2 == 0) ++start_odd;
-
-        double dy = static_cast<double>(y);
-        int64 n_start = start_odd + 2 * threadIdx.x;
-        int64 n_stride = 2 * blockDim.x;
-
-        for (int64 n = n_start; n <= kappa_y; n += n_stride) {
-            int64 q = fast_div(y, dy, n);
+    if (two_kappa_y2 > kappa_y) {
+        int64 start_even = kappa_y + 1;
+        if (start_even % 2 != 0) ++start_even;
+        int64 ne_start = start_even + 2 * lane_id;
+        for (int64 ne = ne_start; ne <= two_kappa_y2; ne += 64) {
+            int64 q = fast_div(y, dy, ne);
+            my_s1 -= __ldg(d_M + q);
+        }
+    } else if (two_kappa_y2 < kappa_y) {
+        int64 start_even = two_kappa_y2 + 1;
+        if (start_even % 2 != 0) ++start_even;
+        int64 ne_start = start_even + 2 * lane_id;
+        for (int64 ne = ne_start; ne <= kappa_y; ne += 64) {
+            int64 q = fast_div(y, dy, ne);
             my_s1 += __ldg(d_M + q);
         }
-
-        if (two_kappa_y2 > kappa_y) {
-            int64 start_even = kappa_y + 1;
-            if (start_even % 2 != 0) ++start_even;
-            int64 ne_start = start_even + 2 * threadIdx.x;
-            for (int64 ne = ne_start; ne <= two_kappa_y2; ne += n_stride) {
-                int64 q = fast_div(y, dy, ne);
-                my_s1 -= __ldg(d_M + q);
-            }
-        } else if (two_kappa_y2 < kappa_y) {
-            int64 start_even = two_kappa_y2 + 1;
-            if (start_even % 2 != 0) ++start_even;
-            int64 ne_start = start_even + 2 * threadIdx.x;
-            for (int64 ne = ne_start; ne <= kappa_y; ne += n_stride) {
-                int64 q = fast_div(y, dy, ne);
-                my_s1 += __ldg(d_M + q);
-            }
-        }
-
-        int64 my_s2 = eval_s2_combined_block(y, A, B, d_mu);
-
-        int64 block_s1 = block_reduce_sum(my_s1);
-        int64 block_s2 = block_reduce_sum(my_s2);
-
-        if (threadIdx.x == 0) {
-            int64 term = -block_s1 + (kappa_y * static_cast<int64>(__ldg(d_M + A)) - kappa_y2 * static_cast<int64>(__ldg(d_M + B))) - block_s2;
-            atomicAdd(reinterpret_cast<unsigned long long*>(d_total_sum), static_cast<unsigned long long>(mu_k * term));
-        }
-        __syncthreads();
     }
+
+    int64 my_s2 = eval_s2_combined_warp(y, A, B, d_mu, lane_id);
+    int64 warp_s1 = warp_reduce_sum(my_s1);
+    int64 warp_s2 = warp_reduce_sum(my_s2);
+
+    return -warp_s1 + (kappa_y * static_cast<int64>(__ldg(d_M + A)) - kappa_y2 * static_cast<int64>(__ldg(d_M + B))) - warp_s2;
 }
 
-__global__ void eval_dr_single_heavy_kernel(
-    int64 X,
-    int64 u,
-    double cx,
-    const int64* __restrict__ d_odd_k,
-    int64 num_heavy_k,
-    const int16_t* __restrict__ d_M,
-    const int8_t* __restrict__ d_mu,
-    int64* __restrict__ d_total_sum
-) {
-    for (int64 k_idx = blockIdx.x; k_idx < num_heavy_k; k_idx += gridDim.x) {
-        int64 k = d_odd_k[k_idx];
-        int8_t mu_k = __ldg(d_mu + k);
-        if (mu_k == 0) continue;
+__device__ inline int64 eval_single_S_device(int64 y, int64 u, double cx, const int16_t* __restrict__ d_M, const int8_t* __restrict__ d_mu, int lane_id) {
+    int64 A = static_cast<int64>(cx * sqrt(static_cast<double>(y)));
+    if (A >= y) A = y - 1;
+    if (A < 1) A = 1;
+    int64 kappa_y = y / (A + 1);
 
-        int64 y = X / k;
-        int64 A = static_cast<int64>(cx * sqrt(static_cast<double>(y)));
-        if (A >= y) A = y - 1;
-        if (A < 1) A = 1;
-        int64 kappa_y = y / (A + 1);
+    int64 my_s1 = 0;
+    int64 start_n = y / u + 1;
+    double dy = static_cast<double>(y);
 
-        int64 my_s1 = 0;
-        int64 start_n = y / u + 1;
-        double dy = static_cast<double>(y);
-
-        for (int64 n = start_n + threadIdx.x; n <= kappa_y; n += blockDim.x) {
-            int64 q = fast_div(y, dy, n);
-            my_s1 += __ldg(d_M + q);
-        }
-
-        int64 my_s2 = eval_s2_single_block(y, A, d_mu);
-
-        int64 block_s1 = block_reduce_sum(my_s1);
-        int64 block_s2 = block_reduce_sum(my_s2);
-
-        if (threadIdx.x == 0) {
-            int64 S_val = 1 - block_s1 + kappa_y * static_cast<int64>(__ldg(d_M + A)) - block_s2;
-            atomicAdd(reinterpret_cast<unsigned long long*>(d_total_sum), static_cast<unsigned long long>(mu_k * S_val));
-        }
-        __syncthreads();
+    for (int64 n = start_n + lane_id; n <= kappa_y; n += 32) {
+        int64 q = fast_div(y, dy, n);
+        my_s1 += __ldg(d_M + q);
     }
+
+    int64 my_s2 = eval_s2_single_warp(y, A, d_mu, lane_id);
+    int64 warp_s1 = warp_reduce_sum(my_s1);
+    int64 warp_s2 = warp_reduce_sum(my_s2);
+
+    return 1 - warp_s1 + kappa_y * static_cast<int64>(__ldg(d_M + A)) - warp_s2;
 }
 
 // ---------------------------------------------------------------------------
-// 4. Warp-Collaborative Kernels: 1 Warp (32 threads) per k (Zero divergence!)
+// 2. Mod-6 Wheel CUDA Warp Kernels
 // ---------------------------------------------------------------------------
-__global__ void eval_dr_combined_warp_kernel(
-    int64 X,
-    int64 u,
-    double cx,
-    const int64* __restrict__ d_odd_k,
-    int64 num_k,
-    const int16_t* __restrict__ d_M,
-    const int8_t* __restrict__ d_mu,
+__global__ void eval_dr_wheel_p1_kernel(
+    int64 X, int64 u, double cx,
+    const int64* __restrict__ d_k, int64 num_k,
+    const int16_t* __restrict__ d_M, const int8_t* __restrict__ d_mu,
     int64* __restrict__ d_total_sum
 ) {
     int lane_id = threadIdx.x % 32;
@@ -418,74 +281,24 @@ __global__ void eval_dr_combined_warp_kernel(
     int num_warps = gridDim.x * (blockDim.x / 32);
 
     for (int64 i = warp_id; i < num_k; i += num_warps) {
-        int64 k = d_odd_k[i];
+        int64 k = d_k[i];
         int8_t mu_k = __ldg(d_mu + k);
         if (mu_k == 0) continue;
 
         int64 y = X / k;
-        int64 y2 = y / 2;
-
-        int64 A = static_cast<int64>(cx * sqrt(static_cast<double>(y)));
-        int64 B = static_cast<int64>(cx * sqrt(static_cast<double>(y2)));
-        if (A >= y) A = y - 1;
-        if (B >= y2) B = y2 - 1;
-        if (A < 1) A = 1;
-        if (B < 1) B = 1;
-
-        int64 kappa_y = y / (A + 1);
-        int64 kappa_y2 = y2 / (B + 1);
-        int64 two_kappa_y2 = 2 * kappa_y2;
-
-        int64 my_s1 = 0;
-        int64 start_odd = (y / u + 1);
-        if (start_odd % 2 == 0) ++start_odd;
-
-        double dy = static_cast<double>(y);
-        int64 n_start = start_odd + 2 * lane_id;
-
-        for (int64 n = n_start; n <= kappa_y; n += 64) {
-            int64 q = fast_div(y, dy, n);
-            my_s1 += __ldg(d_M + q);
-        }
-
-        if (two_kappa_y2 > kappa_y) {
-            int64 start_even = kappa_y + 1;
-            if (start_even % 2 != 0) ++start_even;
-            int64 ne_start = start_even + 2 * lane_id;
-            for (int64 ne = ne_start; ne <= two_kappa_y2; ne += 64) {
-                int64 q = fast_div(y, dy, ne);
-                my_s1 -= __ldg(d_M + q);
-            }
-        } else if (two_kappa_y2 < kappa_y) {
-            int64 start_even = two_kappa_y2 + 1;
-            if (start_even % 2 != 0) ++start_even;
-            int64 ne_start = start_even + 2 * lane_id;
-            for (int64 ne = ne_start; ne <= kappa_y; ne += 64) {
-                int64 q = fast_div(y, dy, ne);
-                my_s1 += __ldg(d_M + q);
-            }
-        }
-
-        int64 my_s2 = eval_s2_combined_warp(y, A, B, d_mu, lane_id);
-
-        int64 warp_s1 = warp_reduce_sum(my_s1);
-        int64 warp_s2 = warp_reduce_sum(my_s2);
+        int64 term = eval_comb2_device(y, y / 2, u, cx, d_M, d_mu, lane_id) 
+                   - eval_comb2_device(y / 3, y / 6, u, cx, d_M, d_mu, lane_id);
 
         if (lane_id == 0) {
-            int64 term = -warp_s1 + (kappa_y * static_cast<int64>(__ldg(d_M + A)) - kappa_y2 * static_cast<int64>(__ldg(d_M + B))) - warp_s2;
             atomicAdd(reinterpret_cast<unsigned long long*>(d_total_sum), static_cast<unsigned long long>(mu_k * term));
         }
     }
 }
 
-__global__ void eval_dr_single_warp_kernel(
-    int64 X,
-    int64 u,
-    double cx,
-    const int64* __restrict__ d_odd_k,
-    int64 num_k,
-    const int16_t* __restrict__ d_M,
-    const int8_t* __restrict__ d_mu,
+__global__ void eval_dr_wheel_p2_kernel(
+    int64 X, int64 u, double cx,
+    const int64* __restrict__ d_k, int64 num_k,
+    const int16_t* __restrict__ d_M, const int8_t* __restrict__ d_mu,
     int64* __restrict__ d_total_sum
 ) {
     int lane_id = threadIdx.x % 32;
@@ -493,39 +306,70 @@ __global__ void eval_dr_single_warp_kernel(
     int num_warps = gridDim.x * (blockDim.x / 32);
 
     for (int64 i = warp_id; i < num_k; i += num_warps) {
-        int64 k = d_odd_k[i];
+        int64 k = d_k[i];
         int8_t mu_k = __ldg(d_mu + k);
         if (mu_k == 0) continue;
 
         int64 y = X / k;
-        int64 A = static_cast<int64>(cx * sqrt(static_cast<double>(y)));
-        if (A >= y) A = y - 1;
-        if (A < 1) A = 1;
-        int64 kappa_y = y / (A + 1);
-
-        int64 my_s1 = 0;
-        int64 start_n = y / u + 1;
-        double dy = static_cast<double>(y);
-
-        for (int64 n = start_n + lane_id; n <= kappa_y; n += 32) {
-            int64 q = fast_div(y, dy, n);
-            my_s1 += __ldg(d_M + q);
-        }
-
-        int64 my_s2 = eval_s2_single_warp(y, A, d_mu, lane_id);
-
-        int64 warp_s1 = warp_reduce_sum(my_s1);
-        int64 warp_s2 = warp_reduce_sum(my_s2);
+        int64 term = eval_comb2_device(y, y / 2, u, cx, d_M, d_mu, lane_id) 
+                   - eval_single_S_device(y / 3, u, cx, d_M, d_mu, lane_id);
 
         if (lane_id == 0) {
-            int64 S_val = 1 - warp_s1 + kappa_y * static_cast<int64>(__ldg(d_M + A)) - warp_s2;
-            atomicAdd(reinterpret_cast<unsigned long long*>(d_total_sum), static_cast<unsigned long long>(mu_k * S_val));
+            atomicAdd(reinterpret_cast<unsigned long long*>(d_total_sum), static_cast<unsigned long long>(mu_k * term));
+        }
+    }
+}
+
+__global__ void eval_dr_wheel_p3_kernel(
+    int64 X, int64 u, double cx,
+    const int64* __restrict__ d_k, int64 num_k,
+    const int16_t* __restrict__ d_M, const int8_t* __restrict__ d_mu,
+    int64* __restrict__ d_total_sum
+) {
+    int lane_id = threadIdx.x % 32;
+    int warp_id = (blockIdx.x * (blockDim.x / 32)) + (threadIdx.x / 32);
+    int num_warps = gridDim.x * (blockDim.x / 32);
+
+    for (int64 i = warp_id; i < num_k; i += num_warps) {
+        int64 k = d_k[i];
+        int8_t mu_k = __ldg(d_mu + k);
+        if (mu_k == 0) continue;
+
+        int64 y = X / k;
+        int64 term = eval_comb2_device(y, y / 2, u, cx, d_M, d_mu, lane_id);
+
+        if (lane_id == 0) {
+            atomicAdd(reinterpret_cast<unsigned long long*>(d_total_sum), static_cast<unsigned long long>(mu_k * term));
+        }
+    }
+}
+
+__global__ void eval_dr_wheel_p4_kernel(
+    int64 X, int64 u, double cx,
+    const int64* __restrict__ d_k, int64 num_k,
+    const int16_t* __restrict__ d_M, const int8_t* __restrict__ d_mu,
+    int64* __restrict__ d_total_sum
+) {
+    int lane_id = threadIdx.x % 32;
+    int warp_id = (blockIdx.x * (blockDim.x / 32)) + (threadIdx.x / 32);
+    int num_warps = gridDim.x * (blockDim.x / 32);
+
+    for (int64 i = warp_id; i < num_k; i += num_warps) {
+        int64 k = d_k[i];
+        int8_t mu_k = __ldg(d_mu + k);
+        if (mu_k == 0) continue;
+
+        int64 y = X / k;
+        int64 term = eval_single_S_device(y, u, cx, d_M, d_mu, lane_id);
+
+        if (lane_id == 0) {
+            atomicAdd(reinterpret_cast<unsigned long long*>(d_total_sum), static_cast<unsigned long long>(mu_k * term));
         }
     }
 }
 
 /**
- * Master CUDA Deléglise-Rivat Mertens Engine.
+ * Master CUDA Deléglise-Rivat Mertens Engine with Mod-6 Full Wheel Reduction.
  */
 class CudaDelégliseRivatEngine {
 public:
@@ -541,7 +385,6 @@ public:
      * Dynamically chooses optimal sieve cutoff u for target X on GPU.
      */
     static inline int64 choose_gpu_sieve_limit(int64 X, int threads) {
-        (void)threads;
         if (X <= 50000000LL) return X;
 
         double loglogX = std::log(std::max(2.0, std::log(static_cast<double>(X))));
@@ -553,8 +396,9 @@ public:
         int64 S = mertens_dr::isqrt(X);
         if (u < 3 * S) u = 3 * S;
 
-        // Cap u safely at 1.4 Billion (~2.8 GB table) to stay well within 12.7 GB Host System RAM
-        return std::min(u, 1400000000LL);
+        // Auto-scale cap based on host thread count to balance host sieve vs GPU execution
+        int64 cap = (threads > 0 && threads <= 2) ? 600000000LL : 1400000000LL;
+        return std::min(u, cap);
     }
 
     /**
@@ -572,11 +416,19 @@ public:
             return mertens_dr::DelégliseRivatEngine::compute_mertens(X, host_threads);
         }
 
-        int64 u = choose_gpu_sieve_limit(X, host_threads);
+        int threads = (host_threads > 0 ? host_threads : 
+#ifdef _OPENMP
+            omp_get_max_threads()
+#else
+            1
+#endif
+        );
+
+        int64 u = choose_gpu_sieve_limit(X, threads);
 
         // 1. Precompute sieve table on host
         auto t0 = std::chrono::high_resolution_clock::now();
-        mertens_dr::SieveTable table(u, host_threads);
+        mertens_dr::SieveTable table(u, threads);
         auto t1 = std::chrono::high_resolution_clock::now();
         if (stats) stats->host_sieve_time = std::chrono::duration<double>(t1 - t0).count();
 
@@ -586,22 +438,20 @@ public:
 
         const double cx = mertens_dr::DelégliseRivatEngine::choose_cx(X);
         const int64 N = X / u;
-        const int64 N_half = N / 2;
         const int8_t* mu_ptr = table.mu.data();
 
-        // Collect odd square-free k
-        std::vector<int64> odd_k_comb;
-        std::vector<int64> odd_k_single;
-        odd_k_comb.reserve(static_cast<size_t>(N_half / 2));
-        odd_k_single.reserve(static_cast<size_t>((N - N_half) / 2));
+        int64 n6 = N / 6;
+        int64 n3 = N / 3;
+        int64 n2 = N / 2;
 
-        for (int64 k = 1; k <= N; k += 2) {
+        std::vector<int64> k_p1, k_p2, k_p3, k_p4;
+        for (int64 k = 1; k <= N; ++k) {
+            if (k % 2 == 0 || k % 3 == 0) continue;
             if (mu_ptr[k] != 0) {
-                if (k <= N_half) {
-                    odd_k_comb.push_back(k);
-                } else {
-                    odd_k_single.push_back(k);
-                }
+                if (k <= n6) k_p1.push_back(k);
+                else if (k <= n3) k_p2.push_back(k);
+                else if (k <= n2) k_p3.push_back(k);
+                else k_p4.push_back(k);
             }
         }
 
@@ -610,20 +460,20 @@ public:
 
         int16_t* d_M = nullptr;
         int8_t* d_mu = nullptr;
-        int64* d_odd_k_comb = nullptr;
-        int64* d_odd_k_single = nullptr;
+        int64* d_k_p1 = nullptr;
+        int64* d_k_p2 = nullptr;
+        int64* d_k_p3 = nullptr;
+        int64* d_k_p4 = nullptr;
         int64* d_total_sum = nullptr;
 
         CUDA_CHECK(cudaMalloc(&d_M, (u + 1) * sizeof(int16_t)));
         CUDA_CHECK(cudaMalloc(&d_mu, (mu_limit + 1) * sizeof(int8_t)));
         CUDA_CHECK(cudaMalloc(&d_total_sum, sizeof(int64)));
 
-        if (!odd_k_comb.empty()) {
-            CUDA_CHECK(cudaMalloc(&d_odd_k_comb, odd_k_comb.size() * sizeof(int64)));
-        }
-        if (!odd_k_single.empty()) {
-            CUDA_CHECK(cudaMalloc(&d_odd_k_single, odd_k_single.size() * sizeof(int64)));
-        }
+        if (!k_p1.empty()) CUDA_CHECK(cudaMalloc(&d_k_p1, k_p1.size() * sizeof(int64)));
+        if (!k_p2.empty()) CUDA_CHECK(cudaMalloc(&d_k_p2, k_p2.size() * sizeof(int64)));
+        if (!k_p3.empty()) CUDA_CHECK(cudaMalloc(&d_k_p3, k_p3.size() * sizeof(int64)));
+        if (!k_p4.empty()) CUDA_CHECK(cudaMalloc(&d_k_p4, k_p4.size() * sizeof(int64)));
 
         int64 zero_val = 0;
         auto t2 = std::chrono::high_resolution_clock::now();
@@ -631,12 +481,10 @@ public:
         CUDA_CHECK(cudaMemcpy(d_M, table.data(), (u + 1) * sizeof(int16_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_mu, table.mu.data(), (mu_limit + 1) * sizeof(int8_t), cudaMemcpyHostToDevice));
 
-        if (!odd_k_comb.empty()) {
-            CUDA_CHECK(cudaMemcpy(d_odd_k_comb, odd_k_comb.data(), odd_k_comb.size() * sizeof(int64), cudaMemcpyHostToDevice));
-        }
-        if (!odd_k_single.empty()) {
-            CUDA_CHECK(cudaMemcpy(d_odd_k_single, odd_k_single.data(), odd_k_single.size() * sizeof(int64), cudaMemcpyHostToDevice));
-        }
+        if (!k_p1.empty()) CUDA_CHECK(cudaMemcpy(d_k_p1, k_p1.data(), k_p1.size() * sizeof(int64), cudaMemcpyHostToDevice));
+        if (!k_p2.empty()) CUDA_CHECK(cudaMemcpy(d_k_p2, k_p2.data(), k_p2.size() * sizeof(int64), cudaMemcpyHostToDevice));
+        if (!k_p3.empty()) CUDA_CHECK(cudaMemcpy(d_k_p3, k_p3.data(), k_p3.size() * sizeof(int64), cudaMemcpyHostToDevice));
+        if (!k_p4.empty()) CUDA_CHECK(cudaMemcpy(d_k_p4, k_p4.data(), k_p4.size() * sizeof(int64), cudaMemcpyHostToDevice));
         auto t3 = std::chrono::high_resolution_clock::now();
         if (stats) stats->h2d_copy_time = std::chrono::duration<double>(t3 - t2).count();
 
@@ -646,65 +494,41 @@ public:
         CUDA_CHECK(cudaEventCreate(&k_stop));
         CUDA_CHECK(cudaEventRecord(k_start));
 
-        int num_sms = 40; // Tesla T4 has 40 SMs
+        int num_sms = 40;
         int dev_id = 0;
         if (cudaGetDevice(&dev_id) == cudaSuccess) {
             cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id);
         }
 
         const int block_size = 256;
-        const int64 heavy_k_limit = 256; // Top heavy terms run on 512-thread dedicated blocks
+        int warp_grid = num_sms * 16;
 
-        // Combined Range Execution
-        if (!odd_k_comb.empty()) {
-            int64 num_comb = static_cast<int64>(odd_k_comb.size());
-            int64 num_heavy = 0;
-            while (num_heavy < num_comb && odd_k_comb[num_heavy] <= heavy_k_limit) {
-                ++num_heavy;
-            }
-
-            if (num_heavy > 0) {
-                int heavy_grid = std::min(static_cast<int>(num_heavy), num_sms * 8);
-                eval_dr_combined_heavy_kernel<<<heavy_grid, 512>>>(
-                    X, u, cx, d_odd_k_comb, num_heavy, d_M, d_mu, d_total_sum
-                );
-                CUDA_CHECK(cudaGetLastError());
-            }
-
-            int64 num_light = num_comb - num_heavy;
-            if (num_light > 0) {
-                int warp_grid = num_sms * 16;
-                eval_dr_combined_warp_kernel<<<warp_grid, block_size>>>(
-                    X, u, cx, d_odd_k_comb + num_heavy, num_light, d_M, d_mu, d_total_sum
-                );
-                CUDA_CHECK(cudaGetLastError());
-            }
+        if (!k_p1.empty()) {
+            eval_dr_wheel_p1_kernel<<<warp_grid, block_size>>>(
+                X, u, cx, d_k_p1, k_p1.size(), d_M, d_mu, d_total_sum
+            );
+            CUDA_CHECK(cudaGetLastError());
         }
 
-        // Single Range Execution
-        if (!odd_k_single.empty()) {
-            int64 num_single = static_cast<int64>(odd_k_single.size());
-            int64 num_heavy = 0;
-            while (num_heavy < num_single && odd_k_single[num_heavy] <= heavy_k_limit) {
-                ++num_heavy;
-            }
+        if (!k_p2.empty()) {
+            eval_dr_wheel_p2_kernel<<<warp_grid, block_size>>>(
+                X, u, cx, d_k_p2, k_p2.size(), d_M, d_mu, d_total_sum
+            );
+            CUDA_CHECK(cudaGetLastError());
+        }
 
-            if (num_heavy > 0) {
-                int heavy_grid = std::min(static_cast<int>(num_heavy), num_sms * 8);
-                eval_dr_single_heavy_kernel<<<heavy_grid, 512>>>(
-                    X, u, cx, d_odd_k_single, num_heavy, d_M, d_mu, d_total_sum
-                );
-                CUDA_CHECK(cudaGetLastError());
-            }
+        if (!k_p3.empty()) {
+            eval_dr_wheel_p3_kernel<<<warp_grid, block_size>>>(
+                X, u, cx, d_k_p3, k_p3.size(), d_M, d_mu, d_total_sum
+            );
+            CUDA_CHECK(cudaGetLastError());
+        }
 
-            int64 num_light = num_single - num_heavy;
-            if (num_light > 0) {
-                int warp_grid = num_sms * 16;
-                eval_dr_single_warp_kernel<<<warp_grid, block_size>>>(
-                    X, u, cx, d_odd_k_single + num_heavy, num_light, d_M, d_mu, d_total_sum
-                );
-                CUDA_CHECK(cudaGetLastError());
-            }
+        if (!k_p4.empty()) {
+            eval_dr_wheel_p4_kernel<<<warp_grid, block_size>>>(
+                X, u, cx, d_k_p4, k_p4.size(), d_M, d_mu, d_total_sum
+            );
+            CUDA_CHECK(cudaGetLastError());
         }
 
         CUDA_CHECK(cudaEventRecord(k_stop));
@@ -728,8 +552,10 @@ public:
         CUDA_CHECK(cudaFree(d_M));
         CUDA_CHECK(cudaFree(d_mu));
         CUDA_CHECK(cudaFree(d_total_sum));
-        if (d_odd_k_comb) CUDA_CHECK(cudaFree(d_odd_k_comb));
-        if (d_odd_k_single) CUDA_CHECK(cudaFree(d_odd_k_single));
+        if (d_k_p1) CUDA_CHECK(cudaFree(d_k_p1));
+        if (d_k_p2) CUDA_CHECK(cudaFree(d_k_p2));
+        if (d_k_p3) CUDA_CHECK(cudaFree(d_k_p3));
+        if (d_k_p4) CUDA_CHECK(cudaFree(d_k_p4));
 
         auto t_end = std::chrono::high_resolution_clock::now();
         if (stats) stats->total_time = std::chrono::duration<double>(t_end - t_start).count();
