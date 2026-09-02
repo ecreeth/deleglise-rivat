@@ -227,12 +227,9 @@ alignas(16) static constexpr int8_t LUT_P1[12] = {0, 1, 0, 0, 0, 1, 1, 2, 2, 2, 
 alignas(16) static constexpr int8_t LUT_P2[12] = {0, 1, 0, 0, 0, 1, 1, 2, 2, 2, 1, 2};
 alignas(16) static constexpr int8_t LUT_P3[12] = {0, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1};
 alignas(16) static constexpr int8_t LUT_P4[12] = {0, 1, 0, 0, 0, 1, -1, 0, 0, 0, -1, 0};
-alignas(16) static constexpr int8_t LUT_P5[12] = {0, 1, 0, 1, 1, 2, 1, 2, 2, 3, 2, 3};
-alignas(16) static constexpr int8_t LUT_P7[12] = {0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6};
 
 alignas(16) static constexpr int8_t LUT_S1[12] = {0, 1, 1, 1, 1, 2, 2, 3, 3, 3, 3, 4};
 alignas(16) static constexpr int8_t LUT_S2[12] = {0, 1, 1, 1, 1, 2, 1, 2, 2, 2, 2, 3};
-alignas(16) static constexpr int8_t LUT_S3[12] = {0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6};
 
 struct Piece1 { static inline int64 eval(int64 q) noexcept { int64 k = q / 12; int64 r = q % 12; return 2 * k + LUT_P1[r]; } };
 struct Piece2 { static inline int64 eval(int64 q) noexcept { int64 k = q / 12; int64 r = q % 12; return 3 * k + LUT_P2[r]; } };
@@ -409,7 +406,8 @@ public:
     }
 
     /**
-     * Computes the Mertens Function M(X) = sum_{n=1}^X mu(n) in O(X^(2/3)).
+     * Computes the Mertens Function M(X) = sum_{n=1}^X mu(n) in O(X^(2/3))
+     * using the Mod-6 Full Wheel Deléglise-Rivat reduction.
      */
     static int64 compute_mertens(int64 X, int num_threads = 0) {
         if (X < 1) return 0;
@@ -464,40 +462,49 @@ public:
             return table.get_M(X);
         }
 
-        const double cx = choose_cx(X); // Optimal balance for superscalar SIMD pipelines
+        const double cx = choose_cx(X);
         const int64 N = X / u;
-        const int64 N_half = N / 2;
         const int16_t* __restrict M_ptr = table.data();
         const int8_t* __restrict mu_ptr = table.mu.data();
 
-        // Collect all odd square-free k <= N
-        std::vector<int64> odd_k_comb;
-        std::vector<int64> odd_k_single;
-        odd_k_comb.reserve(static_cast<size_t>(N_half / 2));
-        odd_k_single.reserve(static_cast<size_t>((N - N_half) / 2));
+        int64 n6 = N / 6;
+        int64 n3 = N / 3;
+        int64 n2 = N / 2;
 
-        for (int64 k = 1; k <= N; k += 2) {
+        std::vector<int64> k_p1; // k <= N/6: S(y) - S(y/2) - S(y/3) + S(y/6)
+        std::vector<int64> k_p2; // N/6 < k <= N/3: S(y) - S(y/2) - S(y/3)
+        std::vector<int64> k_p3; // N/3 < k <= N/2: S(y) - S(y/2)
+        std::vector<int64> k_p4; // N/2 < k <= N: S(y)
+
+        for (int64 k = 1; k <= N; ++k) {
+            if (k % 2 == 0 || k % 3 == 0) continue;
             if (mu_ptr[k] != 0) {
-                if (k <= N_half) {
-                    odd_k_comb.push_back(k);
-                } else {
-                    odd_k_single.push_back(k);
-                }
+                if (k <= n6) k_p1.push_back(k);
+                else if (k <= n3) k_p2.push_back(k);
+                else if (k <= n2) k_p3.push_back(k);
+                else k_p4.push_back(k);
             }
         }
 
         int64 total_M = 0;
 
-        // Process Combined Range: k <= N/2
-        #ifdef _OPENMP
-        #pragma omp parallel for reduction(+:total_M) schedule(guided) num_threads(threads)
-        #endif
-        for (size_t idx = 0; idx < odd_k_comb.size(); ++idx) {
-            int64 k = odd_k_comb[idx];
-            int8_t mu_k = mu_ptr[k];
-            int64 y = X / k;
-            int64 y2 = y / 2;
+        auto eval_single_S = [&](int64 y) noexcept -> int64 {
+            int64 A = static_cast<int64>(cx * std::sqrt(static_cast<double>(y)));
+            if (A >= y) A = y - 1;
+            if (A < 1) A = 1;
+            int64 kappa_y = y / (A + 1);
 
+            int64 S1 = 0;
+            int64 start_n = y / u + 1;
+            double dy = static_cast<double>(y);
+            for (int64 n = start_n; n <= kappa_y; ++n) {
+                S1 += M_ptr[static_cast<int64>(dy / static_cast<double>(n))];
+            }
+            int64 S2 = eval_s2_single(y, A, mu_ptr);
+            return 1 - S1 + kappa_y * static_cast<int64>(M_ptr[A]) - S2;
+        };
+
+        auto eval_comb2 = [&](int64 y, int64 y2) noexcept -> int64 {
             int64 A = static_cast<int64>(cx * std::sqrt(static_cast<double>(y)));
             int64 B = static_cast<int64>(cx * std::sqrt(static_cast<double>(y2)));
             if (A >= y) A = y - 1;
@@ -509,7 +516,6 @@ public:
             int64 kappa_y2 = y2 / (B + 1);
             int64 two_kappa_y2 = 2 * kappa_y2;
 
-            // 1. S1(y, u) - S1(y/2, u) with Dual-Level Software Prefetching
             int64 S1_diff = 0;
             int64 start_odd = (y / u + 1);
             if (start_odd % 2 == 0) ++start_odd;
@@ -520,7 +526,6 @@ public:
 #if defined(__ARM_NEON)
             float64x2_t v_dy = vdupq_n_f64(dy);
             for (; n + 15 <= kappa_y; n += 8) {
-                // Prefetch lookahead 16 steps ahead
                 int64 n_pref = n + 16;
                 int64 q_p0 = static_cast<int64>(dy / static_cast<double>(n_pref));
                 int64 q_p1 = static_cast<int64>(dy / static_cast<double>(n_pref + 4));
@@ -537,14 +542,6 @@ public:
                 int64 q2 = static_cast<int64>(vgetq_lane_f64(v_q2, 0));
                 int64 q3 = static_cast<int64>(vgetq_lane_f64(v_q2, 1));
 
-                S1_diff += M_ptr[q0] + M_ptr[q1] + M_ptr[q2] + M_ptr[q3];
-            }
-#else
-            for (; n + 7 <= kappa_y; n += 8) {
-                int64 q0 = static_cast<int64>(dy / static_cast<double>(n));
-                int64 q1 = static_cast<int64>(dy / static_cast<double>(n + 2));
-                int64 q2 = static_cast<int64>(dy / static_cast<double>(n + 4));
-                int64 q3 = static_cast<int64>(dy / static_cast<double>(n + 6));
                 S1_diff += M_ptr[q0] + M_ptr[q1] + M_ptr[q2] + M_ptr[q3];
             }
 #endif
@@ -566,54 +563,48 @@ public:
                 }
             }
 
-            // 2. S2(y) - S2(y/2) mod 6 piecewise evaluation via LUT
             int64 S2_diff = eval_s2_combined(y, A, B, mu_ptr);
+            return -S1_diff + (kappa_y * static_cast<int64>(M_ptr[A]) - kappa_y2 * static_cast<int64>(M_ptr[B])) - S2_diff;
+        };
 
-            // S(y, u) - S(y/2, u)
-            int64 term = -S1_diff + (kappa_y * static_cast<int64>(M_ptr[A]) - kappa_y2 * static_cast<int64>(M_ptr[B])) - S2_diff;
+        // Range 1: k <= N/6 -> (S(y) - S(y/2)) - (S(y/3) - S(y/6))
+        #pragma omp parallel for reduction(+:total_M) schedule(guided) num_threads(threads)
+        for (size_t i = 0; i < k_p1.size(); ++i) {
+            int64 k = k_p1[i];
+            int8_t mu_k = mu_ptr[k];
+            int64 y = X / k;
+            int64 term = eval_comb2(y, y / 2) - eval_comb2(y / 3, y / 6);
             total_M += static_cast<int64>(mu_k) * term;
         }
 
-        // Process Single Range: N/2 < k <= N
-        #ifdef _OPENMP
+        // Range 2: N/6 < k <= N/3 -> (S(y) - S(y/2)) - S(y/3)
         #pragma omp parallel for reduction(+:total_M) schedule(guided) num_threads(threads)
-        #endif
-        for (size_t idx = 0; idx < odd_k_single.size(); ++idx) {
-            int64 k = odd_k_single[idx];
+        for (size_t i = 0; i < k_p2.size(); ++i) {
+            int64 k = k_p2[i];
             int8_t mu_k = mu_ptr[k];
             int64 y = X / k;
+            int64 term = eval_comb2(y, y / 2) - eval_single_S(y / 3);
+            total_M += static_cast<int64>(mu_k) * term;
+        }
 
-            int64 A = static_cast<int64>(cx * std::sqrt(static_cast<double>(y)));
-            if (A >= y) A = y - 1;
-            if (A < 1) A = 1;
-            int64 kappa_y = y / (A + 1);
+        // Range 3: N/3 < k <= N/2 -> S(y) - S(y/2)
+        #pragma omp parallel for reduction(+:total_M) schedule(guided) num_threads(threads)
+        for (size_t i = 0; i < k_p3.size(); ++i) {
+            int64 k = k_p3[i];
+            int8_t mu_k = mu_ptr[k];
+            int64 y = X / k;
+            int64 term = eval_comb2(y, y / 2);
+            total_M += static_cast<int64>(mu_k) * term;
+        }
 
-            int64 S1 = 0;
-            int64 start_n = y / u + 1;
-            double dy = static_cast<double>(y);
-            int64 n = start_n;
-
-            for (; n + 7 <= kappa_y; n += 8) {
-                int64 q0 = static_cast<int64>(dy / static_cast<double>(n));
-                int64 q1 = static_cast<int64>(dy / static_cast<double>(n + 1));
-                int64 q2 = static_cast<int64>(dy / static_cast<double>(n + 2));
-                int64 q3 = static_cast<int64>(dy / static_cast<double>(n + 3));
-                int64 q4 = static_cast<int64>(dy / static_cast<double>(n + 4));
-                int64 q5 = static_cast<int64>(dy / static_cast<double>(n + 5));
-                int64 q6 = static_cast<int64>(dy / static_cast<double>(n + 6));
-                int64 q7 = static_cast<int64>(dy / static_cast<double>(n + 7));
-
-                S1 += M_ptr[q0] + M_ptr[q1] + M_ptr[q2] + M_ptr[q3] +
-                      M_ptr[q4] + M_ptr[q5] + M_ptr[q6] + M_ptr[q7];
-            }
-            for (; n <= kappa_y; ++n) {
-                S1 += M_ptr[static_cast<int64>(dy / static_cast<double>(n))];
-            }
-
-            int64 S2 = eval_s2_single(y, A, mu_ptr);
-
-            int64 S_val = 1 - S1 + kappa_y * static_cast<int64>(M_ptr[A]) - S2;
-            total_M += static_cast<int64>(mu_k) * S_val;
+        // Range 4: N/2 < k <= N -> S(y)
+        #pragma omp parallel for reduction(+:total_M) schedule(guided) num_threads(threads)
+        for (size_t i = 0; i < k_p4.size(); ++i) {
+            int64 k = k_p4[i];
+            int8_t mu_k = mu_ptr[k];
+            int64 y = X / k;
+            int64 term = eval_single_S(y);
+            total_M += static_cast<int64>(mu_k) * term;
         }
 
         return total_M;
