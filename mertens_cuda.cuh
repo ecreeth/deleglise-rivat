@@ -120,8 +120,21 @@ __device__ inline int64 run_s2_fast_warp(int64 j_start, int64 j_end, int64 y, do
     int64 m_start = (j_start + 5) / 6;
     int64 m_end = j_end / 6;
 
+    if (m_start > m_end) {
+        for (int64 j = j_start + lane_id; j <= j_end; j += 32) {
+            if (j % 2 != 0 && j % 3 != 0) {
+                int8_t m = __ldg(mu_ptr + j);
+                if (m != 0) {
+                    int64 q = fast_div(y, dy, j);
+                    sum += static_cast<int64>(m) * summand_fn(q);
+                }
+            }
+        }
+        return sum;
+    }
+
     // Head Boundary
-    int64 head_end = (j_end < m_start * 6) ? j_end : (m_start * 6);
+    int64 head_end = m_start * 6;
     for (int64 j = j_start + lane_id; j <= head_end; j += 32) {
         if (j % 2 != 0 && j % 3 != 0) {
             int8_t m = __ldg(mu_ptr + j);
@@ -150,7 +163,7 @@ __device__ inline int64 run_s2_fast_warp(int64 j_start, int64 j_end, int64 y, do
     }
 
     // Tail Boundary
-    int64 tail_start = (j_start > m_end * 6 + 1) ? j_start : (m_end * 6 + 1);
+    int64 tail_start = m_end * 6 + 1;
     for (int64 j = tail_start + lane_id; j <= j_end; j += 32) {
         if (j % 2 != 0 && j % 3 != 0) {
             int8_t m = __ldg(mu_ptr + j);
@@ -213,33 +226,43 @@ __device__ inline int64 eval_comb2_device(int64 y, int64 y2, int64 u, double cx,
     if (start_odd % 2 == 0) ++start_odd;
 
     double dy = static_cast<double>(y);
-    int64 n_start = start_odd + 2 * lane_id;
+    int64 n = start_odd + 2 * lane_id;
 
-    for (int64 n = n_start; n + 64 <= kappa_y; n += 128) {
+    for (; n + 64 <= kappa_y; n += 128) {
         int64 q1 = fast_div(y, dy, n);
         int64 q2 = fast_div(y, dy, n + 64);
         my_s1 += static_cast<int64>(__ldg(d_M + q1)) + static_cast<int64>(__ldg(d_M + q2));
     }
-    for (int64 n = (n_start + ((kappa_y - n_start >= 64) ? ((kappa_y - n_start) / 128 * 128) : 0)); n <= kappa_y; n += 64) {
+    for (; n <= kappa_y; n += 64) {
         int64 q = fast_div(y, dy, n);
-        my_s1 += __ldg(d_M + q);
+        my_s1 += static_cast<int64>(__ldg(d_M + q));
     }
 
     if (two_kappa_y2 > kappa_y) {
         int64 start_even = kappa_y + 1;
         if (start_even % 2 != 0) ++start_even;
-        int64 ne_start = start_even + 2 * lane_id;
-        for (int64 ne = ne_start; ne <= two_kappa_y2; ne += 64) {
+        int64 ne = start_even + 2 * lane_id;
+        for (; ne + 64 <= two_kappa_y2; ne += 128) {
+            int64 q1 = fast_div(y, dy, ne);
+            int64 q2 = fast_div(y, dy, ne + 64);
+            my_s1 -= static_cast<int64>(__ldg(d_M + q1)) + static_cast<int64>(__ldg(d_M + q2));
+        }
+        for (; ne <= two_kappa_y2; ne += 64) {
             int64 q = fast_div(y, dy, ne);
-            my_s1 -= __ldg(d_M + q);
+            my_s1 -= static_cast<int64>(__ldg(d_M + q));
         }
     } else if (two_kappa_y2 < kappa_y) {
         int64 start_even = two_kappa_y2 + 1;
         if (start_even % 2 != 0) ++start_even;
-        int64 ne_start = start_even + 2 * lane_id;
-        for (int64 ne = ne_start; ne <= kappa_y; ne += 64) {
+        int64 ne = start_even + 2 * lane_id;
+        for (; ne + 64 <= kappa_y; ne += 128) {
+            int64 q1 = fast_div(y, dy, ne);
+            int64 q2 = fast_div(y, dy, ne + 64);
+            my_s1 += static_cast<int64>(__ldg(d_M + q1)) + static_cast<int64>(__ldg(d_M + q2));
+        }
+        for (; ne <= kappa_y; ne += 64) {
             int64 q = fast_div(y, dy, ne);
-            my_s1 += __ldg(d_M + q);
+            my_s1 += static_cast<int64>(__ldg(d_M + q));
         }
     }
 
@@ -268,7 +291,7 @@ __device__ inline int64 eval_single_S_device(int64 y, int64 u, double cx, const 
     }
     for (; n <= kappa_y; n += 32) {
         int64 q = fast_div(y, dy, n);
-        my_s1 += __ldg(d_M + q);
+        my_s1 += static_cast<int64>(__ldg(d_M + q));
     }
 
     int64 my_s2 = eval_s2_single_warp(y, A, d_mu, lane_id);

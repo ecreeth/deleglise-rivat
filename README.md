@@ -10,18 +10,17 @@ Based on and extending the mathematical framework described in Greg Hurst's prep
 ## Key Features & Optimizations
 
 1. **Inclusion–Exclusion Reductions:**
-   - **Outer Parity Split:** Evaluates $S(y, u) - S(y/2, u)$ for $k \le N/2$ and $S(y, u)$ for $N/2 < k \le N$ over odd square-free $k$, cutting outer terms by $>69\%$.
+   - **Outer Parity Split & Mod-6 Wheel Reduction:** Evaluates $S(y, u) - S(y/2, u) - S(y/3, u) + S(y/6, u)$ across square-free $k$ coprime to 6, cutting outer terms by $>69\%$.
    - **$S_1$ Parity Cancellation:** Cancels even quotient lookups across surviving odd/even intervals (stride-2 queries).
-   - **$S_2$ Piecewise Reduction:** Partitions $j \le \nu_y, (j, 6)=1$ into 8 exact branchless arithmetic intervals.
+   - **$S_2$ Piecewise Reduction:** Partitions $j \le A, (j, 6)=1$ into 8 exact branchless arithmetic intervals.
 
 2. **Micro-Architectural & SIMD Acceleration:**
-   - **Multi-Threaded Segmented Sieve:** Sieve segments partitioned into $128\text{K}$ L2-cache-blocked chunks with parallel prefix sums, speeding up sieve table generation by $>70\%$.
-   - **Unified LUT & Bitwise Shift Collapse for $S_2$:** Constant 12-element LUT evaluation for Pieces 1–4 and single-cycle bitwise shifts/masks for Pieces 5–8 (`(q >> 2) + (q & 1)`, `q & 1`, `(q + 1) >> 1`, `q`), eliminating all inner loop integer divisions.
-   - **Dual-Level Software Prefetching ($S_1$):** Issues temporal `__builtin_prefetch` instructions 16–32 steps ahead for $M(n)$ lookups, hiding DRAM latency stalls behind NEON vector pipelines.
-   - **ARM64 NEON Vector Division (`vdivq_f64`):** Computes double-precision quotient divisions in parallel.
-   - **Dynamic Hardware-Aware $c_x(X)$ Tuning:** Automatically balances $S_1$ memory traffic and $S_2$ streaming throughput.
+   - **Zero-Allocation Compact Sieve (`FastSieve`):** Generates $M(n)$ prefix sums directly from odd-sieved segments via sequential 64-bit quad writes (`int16_t` quads), capping the $\mu$ table allocation to $<40\text{ MB}$ ($A_{\max}$) instead of $u$ (600 MB) and saving $>1.2\text{ GB}$ of DRAM traffic.
+   - **4-Way Pipelined NEON $S_2$ Runner:** Unrolled 4-way (8 coprime-to-6 values per iteration), maintaining $j$ strictly in SIMD registers with vector step increments (`vaddq_f64`), pipelining 4 `vdivq_f64` instructions, and using `vcvtq_s64_f64` hardware conversions.
+   - **Pure SIMD $S_1$ and Even-$n$ Correction:** Eliminates division overhead from software prefetching and evaluates $S_1$ arithmetic with SIMD vector additions and hardware integer truncation.
+   - **Unified Dynamic Parallel Dispatch:** Merges all 4 OpenMP ranges into a single unified term vector with dynamic chunk scheduling (`schedule(dynamic, 64)`), eliminating 3 barrier syncs and fixing thread starvation.
    - **Flat 16-Bit Cache (`int16_t`):** Uses single-cycle `ldrh` lookups without multi-level cache table indirections.
-   - **Lock-Free Multi-Threading:** OpenMP parallelization with dynamic guided work distribution.
+   - **Dynamic Hardware-Aware $c_x(X)$ Tuning:** Automatically balances $S_1$ memory traffic and $S_2$ streaming throughput ($c_x = 1.35$ for $10^{15}$, $1.15$ for $10^{13..14}$, $0.95$ for $10^{11..12}$).
 
 ---
 
@@ -95,24 +94,27 @@ make test-cuda
 
 ### CPU Performance & Comparison vs. Greg Hurst (arXiv:2607.07566)
 
-| Target $X$ | Exact $M(X)$ | Previous Baseline (Apple M1) | Mod-6 Wheel Engine (Apple M1, 8T) | Greg Hurst Preprint (Reported) | Speedup vs Baseline |
+| Target $X$ | Exact $M(X)$ | Baseline (Apple M1, 8T) | Optimized Engine (Apple M1, 8T) | Greg Hurst Preprint (Reported) | Total Speedup |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **$10^{10}$** | $-33,722$ | $0.0059$ s | **$0.0069$ s** | — | $0.85\times$ |
-| **$10^{11}$** | $-87,856$ | $0.0296$ s | **$0.0233$ s** | — | **$1.27\times$** |
-| **$10^{12}$** | $62,366$ | $0.2098$ s | **$0.0870$ s** | $\sim 0.03$ s (M2 Max) | **$2.41\times$** |
-| **$10^{13}$** | $599,582$ | $0.7938$ s | **$0.4014$ s** | $0.12$ s (M2 Max) | **$1.98\times$** |
-| **$10^{14}$** | $-875,575$ | $4.1109$ s | **$2.3363$ s** | $0.51$ s (M2 Max) | **$1.76\times$** |
-| **$10^{15}$** | $-3,216,373$ | $17.3768$ s | **$9.1995$ s** | $2.10$ s (M2 Max) | **$1.89\times$** |
-| **$10^{16}$** | $-3,195,437$ | $\sim 80$ s | **$\sim 58$ s** | $2.39$ s (M3 Ultra) / $8.4$ s (M2 Max) | **$1.38\times$** |
+| **$10^8$** | $1,928$ | $0.0021$ s | **$0.0008$ s** | — | **$2.6\times$** |
+| **$10^9$** | $-222$ | $0.0062$ s | **$0.0023$ s** | — | **$2.7\times$** |
+| **$10^{10}$** | $-33,722$ | $0.0151$ s | **$0.0061$ s** | — | **$2.5\times$** |
+| **$10^{11}$** | $-87,856$ | $0.0548$ s | **$0.0205$ s** | — | **$2.7\times$** |
+| **$10^{12}$** | $62,366$ | $0.1030$ s | **$0.0690$ s** | $\sim 0.03$ s (M2 Max) | **$1.5\times$** |
+| **$10^{13}$** | $599,582$ | $0.4500$ s | **$0.3102$ s** | $0.12$ s (M2 Max) | **$1.5\times$** |
+| **$10^{14}$** | $-875,575$ | $2.3370$ s | **$1.2973$ s** | $0.51$ s (M2 Max) | **$1.8\times$** |
+| **$10^{15}$** | $-3,216,373$ | $11.3170$ s | **$6.1659$ s** | $2.10$ s (M2 Max) | **$1.84\times$** |
 
 ### NVIDIA Tesla T4 (16GB VRAM, Turing `sm_75` - CUDA Benchmark Sweep)
 
-| Target $X$ | Exact $M(X)$ | Sieve Time (s) | H2D Copy (s) | GPU Kernel (s) | Total Time (s) | Speedup vs Baseline |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **$10^{10}$** | $-33,722$ | $0.0282$ | $0.0014$ | **$0.01223$** | $0.0427$ | — |
-| **$10^{11}$** | $-87,856$ | $0.1181$ | $0.0050$ | **$0.04076$** | $0.1656$ | — |
-| **$10^{12}$** | $62,366$ | $0.6141$ | $0.0312$ | **$0.14751$** | $0.7948$ | — |
-| **$10^{13}$** | $599,582$ | $3.5112$ | $0.1068$ | **$0.30999$** | $3.9329$ | — |
-| **$10^{14}$** | $-875,575$ | $6.5630$ | $0.2683$ | **$0.79253$** | **$7.6294$** | **$1.85\times$ faster** |
-| **$10^{15}$** | $-3,216,373$ | $8.1529$ | $0.2687$ | **$3.70819$** | **$12.1412$** | **$1.72\times$ faster** |
-| **$10^{16}$** | $-3,195,437$ | $8.7062$ | $0.2947$ | **$32.84762$** | **$41.9281$** | — |
+| Target $X$ | Exact $M(X)$ | Sieve Time (s) | H2D Copy (s) | GPU Kernel (s) | Total Time (s) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **$10^8$** | $1,928$ | $0.0026$ | $0.0002$ | **$0.00642$** | $0.1936$ |
+| **$10^9$** | $-222$ | $0.0074$ | $0.0004$ | **$0.00552$** | $0.0137$ |
+| **$10^{10}$** | $-33,722$ | $0.0280$ | $0.0013$ | **$0.01063$** | $0.0408$ |
+| **$10^{11}$** | $-87,856$ | $0.1345$ | $0.0051$ | **$0.02758$** | $0.1689$ |
+| **$10^{12}$** | $62,366$ | $0.6266$ | $0.0257$ | **$0.09034$** | $0.7455$ |
+| **$10^{13}$** | $599,582$ | $2.9205$ | $0.1011$ | **$0.29919$** | $3.3257$ |
+| **$10^{14}$** | $-875,575$ | $9.1989$ | $0.2752$ | **$0.71253$** | $10.1923$ |
+| **$10^{15}$** | $-3,216,373$ | $8.8133$ | $0.3067$ | **$3.68370$** | $12.8182$ |
+| **$10^{16}$** | $-3,195,437$ | $8.5388$ | $0.3075$ | **$31.94584$** | $40.9253$ |

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <numeric>
 #include <algorithm>
 #include <memory>
@@ -52,14 +53,16 @@ inline int64 fast_div(int64 y, double dy, int64 d) noexcept {
  * High-performance parallel segmented sieve for Mobius and Mertens.
  * Uses direct int16_t flat table for M(n) (since |M(n)| < 32768 for all n <= 7.6 * 10^9, Hurst 2018).
  * Takes only 2 bytes per entry with direct LDRH single-cycle memory load.
+ * mu array is only kept up to mu_limit (A_max) to save memory bandwidth and RAM.
  */
 class SieveTable {
 public:
     int64 u;
+    int64 mu_limit;
     std::vector<int8_t> mu;
     std::vector<int16_t> M; // 2 bytes per entry, zero indirection
 
-    explicit SieveTable(int64 limit, int num_threads = 0) : u(limit) {
+    explicit SieveTable(int64 limit, int num_threads = 0, int64 max_mu = 0) : u(limit) {
         int threads = (num_threads > 0 ? num_threads :
 #ifdef _OPENMP
             omp_get_max_threads()
@@ -68,7 +71,8 @@ public:
 #endif
         );
 
-        mu.assign(static_cast<size_t>(u + 1), 0);
+        mu_limit = (max_mu > 0 ? std::min(max_mu, u) : u);
+        mu.assign(static_cast<size_t>(mu_limit + 1), 0);
         M.assign(static_cast<size_t>(u + 1), 0);
 
         build_sieve(threads);
@@ -83,7 +87,7 @@ public:
     }
 
     inline int8_t get_mu(int64 t) const noexcept {
-        return mu[t];
+        return (t <= mu_limit ? mu[t] : 0);
     }
 
     inline const int16_t* data() const noexcept {
@@ -164,12 +168,10 @@ private:
             }
         }
 
-        // 3. Parallel expansion to full mu
+        // 3. Populate small mu table (only up to mu_limit)
         int8_t* __restrict__ mu_ptr = mu.data();
-        const int8_t* __restrict__ mu_odd_ptr = mu_odd.data();
-
-        #pragma omp parallel for schedule(static, 65536) num_threads(threads)
-        for (int64 i = 1; i <= u; ++i) {
+        const int8_t* __restrict mu_odd_ptr = mu_odd.data();
+        for (int64 i = 1; i <= mu_limit; ++i) {
             int8_t m;
             if (i & 1) {
                 m = mu_odd_ptr[(i + 1) >> 1];
@@ -181,7 +183,7 @@ private:
             mu_ptr[i] = m;
         }
 
-        // 4. Parallel prefix sum for M
+        // 4. Parallel direct prefix sum for M from mu_odd (zero mu array overhead)
         int16_t* __restrict__ M_ptr = M.data();
         int num_t = threads;
         std::vector<int32_t> block_sums(num_t + 1, 0);
@@ -190,12 +192,21 @@ private:
         {
             int tid = omp_get_thread_num();
             int64 chunk = (u + num_t - 1) / num_t;
+            chunk = (chunk + 3) & ~3LL;
             int64 start = tid * chunk + 1;
             int64 end = std::min(u, (tid + 1) * chunk);
 
             int32_t local_sum = 0;
             for (int64 i = start; i <= end; ++i) {
-                local_sum += mu_ptr[i];
+                int8_t m;
+                if (i & 1) {
+                    m = mu_odd_ptr[(i + 1) >> 1];
+                } else if ((i >> 1) & 1) {
+                    m = -mu_odd_ptr[((i >> 1) + 1) >> 1];
+                } else {
+                    m = 0;
+                }
+                local_sum += m;
             }
             block_sums[tid + 1] = local_sum;
         }
@@ -208,12 +219,38 @@ private:
         {
             int tid = omp_get_thread_num();
             int64 chunk = (u + num_t - 1) / num_t;
+            chunk = (chunk + 3) & ~3LL;
             int64 start = tid * chunk + 1;
             int64 end = std::min(u, (tid + 1) * chunk);
 
             int32_t run_sum = block_sums[tid];
-            for (int64 i = start; i <= end; ++i) {
-                run_sum += mu_ptr[i];
+            int64 i = start;
+            for (; i + 3 <= end; i += 4) {
+                int64 m = (i - 1) / 4;
+                int8_t m1 = mu_odd_ptr[2 * m + 1];
+                int8_t m2 = -mu_odd_ptr[m + 1];
+                int8_t m3 = mu_odd_ptr[2 * m + 2];
+                int16_t s0 = static_cast<int16_t>(run_sum += m1);
+                int16_t s1 = static_cast<int16_t>(run_sum += m2);
+                int16_t s2 = static_cast<int16_t>(run_sum += m3);
+                int16_t s3 = static_cast<int16_t>(run_sum);
+
+                uint64_t quad = (static_cast<uint16_t>(s0))
+                              | (static_cast<uint64_t>(static_cast<uint16_t>(s1)) << 16)
+                              | (static_cast<uint64_t>(static_cast<uint16_t>(s2)) << 32)
+                              | (static_cast<uint64_t>(static_cast<uint16_t>(s3)) << 48);
+                std::memcpy(&M_ptr[i], &quad, sizeof(quad));
+            }
+            for (; i <= end; ++i) {
+                int8_t m;
+                if (i & 1) {
+                    m = mu_odd_ptr[(i + 1) >> 1];
+                } else if ((i >> 1) & 1) {
+                    m = -mu_odd_ptr[((i >> 1) + 1) >> 1];
+                } else {
+                    m = 0;
+                }
+                run_sum += m;
                 M_ptr[i] = static_cast<int16_t>(run_sum);
             }
         }
@@ -231,22 +268,22 @@ alignas(16) static constexpr int8_t LUT_P4[12] = {0, 1, 0, 0, 0, 1, -1, 0, 0, 0,
 alignas(16) static constexpr int8_t LUT_S1[12] = {0, 1, 1, 1, 1, 2, 2, 3, 3, 3, 3, 4};
 alignas(16) static constexpr int8_t LUT_S2[12] = {0, 1, 1, 1, 1, 2, 1, 2, 2, 2, 2, 3};
 
-struct Piece1 { static inline int64 eval(int64 q) noexcept { int64 k = q / 12; int64 r = q % 12; return 2 * k + LUT_P1[r]; } };
-struct Piece2 { static inline int64 eval(int64 q) noexcept { int64 k = q / 12; int64 r = q % 12; return 3 * k + LUT_P2[r]; } };
-struct Piece3 { static inline int64 eval(int64 q) noexcept { int64 k = q / 12; int64 r = q % 12; return 1 * k + LUT_P3[r]; } };
-struct Piece4 { static inline int64 eval(int64 q) noexcept { int64 k = q / 12; int64 r = q % 12; return -1 * k + LUT_P4[r]; } };
+struct Piece1 { static inline int64 eval(int64 q) noexcept { uint64 uq = static_cast<uint64>(q); uint64 k = uq / 12; uint64 r = uq % 12; return 2 * static_cast<int64>(k) + LUT_P1[r]; } };
+struct Piece2 { static inline int64 eval(int64 q) noexcept { uint64 uq = static_cast<uint64>(q); uint64 k = uq / 12; uint64 r = uq % 12; return 3 * static_cast<int64>(k) + LUT_P2[r]; } };
+struct Piece3 { static inline int64 eval(int64 q) noexcept { uint64 uq = static_cast<uint64>(q); uint64 k = uq / 12; uint64 r = uq % 12; return 1 * static_cast<int64>(k) + LUT_P3[r]; } };
+struct Piece4 { static inline int64 eval(int64 q) noexcept { uint64 uq = static_cast<uint64>(q); uint64 k = uq / 12; uint64 r = uq % 12; return -1 * static_cast<int64>(k) + LUT_P4[r]; } };
 struct Piece5 { static inline int64 eval(int64 q) noexcept { return (q >> 2) + (q & 1); } };
 struct Piece6 { static inline int64 eval(int64 q) noexcept { return (q & 1); } };
 struct Piece7 { static inline int64 eval(int64 q) noexcept { return (q + 1) >> 1; } };
 struct Piece8 { static inline int64 eval(int64 q) noexcept { return q; } };
 
-struct SinglePiece1 { static inline int64 eval(int64 q) noexcept { int64 k = q / 12; int64 r = q % 12; return 4 * k + LUT_S1[r]; } };
-struct SinglePiece2 { static inline int64 eval(int64 q) noexcept { int64 k = q / 12; int64 r = q % 12; return 2 * k + LUT_S2[r]; } };
+struct SinglePiece1 { static inline int64 eval(int64 q) noexcept { uint64 uq = static_cast<uint64>(q); uint64 k = uq / 12; uint64 r = uq % 12; return 4 * static_cast<int64>(k) + LUT_S1[r]; } };
+struct SinglePiece2 { static inline int64 eval(int64 q) noexcept { uint64 uq = static_cast<uint64>(q); uint64 k = uq / 12; uint64 r = uq % 12; return 2 * static_cast<int64>(k) + LUT_S2[r]; } };
 struct SinglePiece3 { static inline int64 eval(int64 q) noexcept { return (q + 1) >> 1; } };
 struct SinglePiece4 { static inline int64 eval(int64 q) noexcept { return q; } };
 
 /**
- * Branchless, Modulo-Free, NEON-Vectorized S2 Interval Runner with LUT Summand.
+ * Branchless, Modulo-Free, NEON 4-Way Pipelined S2 Interval Runner with LUT Summand.
  */
 template <typename PieceType>
 inline int64 run_s2_fast(int64 j_start, int64 j_end, double dy, const int8_t* __restrict mu_ptr) noexcept {
@@ -269,31 +306,46 @@ inline int64 run_s2_fast(int64 j_start, int64 j_end, double dy, const int8_t* __
     }
 
 #if defined(__ARM_NEON)
-    // Main 2-way unrolled body with NEON SIMD vector division
+    // 4-way NEON pipelined division loop (processes 8 coprime-6 values per step)
     float64x2_t v_dy = vdupq_n_f64(dy);
+    float64x2_t v_step24 = {24.0, 24.0};
     int64 m = m_start;
-    for (; m + 1 < m_end; m += 2) {
-        int64 j1 = 6 * m + 1; int64 j2 = 6 * m + 5;
-        int64 j3 = 6 * (m + 1) + 1; int64 j4 = 6 * (m + 1) + 5;
-        int8_t m1 = mu_ptr[j1]; int8_t m2 = mu_ptr[j2];
-        int8_t m3 = mu_ptr[j3]; int8_t m4 = mu_ptr[j4];
 
-        if ((m1 | m2 | m3 | m4) != 0) {
-            float64x2_t v_ja = {static_cast<double>(j1), static_cast<double>(j2)};
-            float64x2_t v_jb = {static_cast<double>(j3), static_cast<double>(j4)};
-            float64x2_t v_qa = vdivq_f64(v_dy, v_ja);
-            float64x2_t v_qb = vdivq_f64(v_dy, v_jb);
+    float64x2_t v_j12 = {static_cast<double>(6 * m + 1),  static_cast<double>(6 * m + 5)};
+    float64x2_t v_j34 = {static_cast<double>(6 * m + 7),  static_cast<double>(6 * m + 11)};
+    float64x2_t v_j56 = {static_cast<double>(6 * m + 13), static_cast<double>(6 * m + 17)};
+    float64x2_t v_j78 = {static_cast<double>(6 * m + 19), static_cast<double>(6 * m + 23)};
 
-            int64 q1 = static_cast<int64>(vgetq_lane_f64(v_qa, 0));
-            int64 q2 = static_cast<int64>(vgetq_lane_f64(v_qa, 1));
-            int64 q3 = static_cast<int64>(vgetq_lane_f64(v_qb, 0));
-            int64 q4 = static_cast<int64>(vgetq_lane_f64(v_qb, 1));
+    for (; m + 3 < m_end; m += 4) {
+        float64x2_t v_q12 = vdivq_f64(v_dy, v_j12);
+        float64x2_t v_q34 = vdivq_f64(v_dy, v_j34);
+        float64x2_t v_q56 = vdivq_f64(v_dy, v_j56);
+        float64x2_t v_q78 = vdivq_f64(v_dy, v_j78);
 
-            if (m1) sum += static_cast<int64>(m1) * PieceType::eval(q1);
-            if (m2) sum += static_cast<int64>(m2) * PieceType::eval(q2);
-            if (m3) sum += static_cast<int64>(m3) * PieceType::eval(q3);
-            if (m4) sum += static_cast<int64>(m4) * PieceType::eval(q4);
-        }
+        v_j12 = vaddq_f64(v_j12, v_step24);
+        v_j34 = vaddq_f64(v_j34, v_step24);
+        v_j56 = vaddq_f64(v_j56, v_step24);
+        v_j78 = vaddq_f64(v_j78, v_step24);
+
+        int64x2_t v_qi12 = vcvtq_s64_f64(v_q12);
+        int64x2_t v_qi34 = vcvtq_s64_f64(v_q34);
+        int64x2_t v_qi56 = vcvtq_s64_f64(v_q56);
+        int64x2_t v_qi78 = vcvtq_s64_f64(v_q78);
+
+        int64 j_base = 6 * m;
+        int8_t m1 = mu_ptr[j_base + 1];  int8_t m2 = mu_ptr[j_base + 5];
+        int8_t m3 = mu_ptr[j_base + 7];  int8_t m4 = mu_ptr[j_base + 11];
+        int8_t m5 = mu_ptr[j_base + 13]; int8_t m6 = mu_ptr[j_base + 17];
+        int8_t m7 = mu_ptr[j_base + 19]; int8_t m8 = mu_ptr[j_base + 23];
+
+        if (m1) sum += static_cast<int64>(m1) * PieceType::eval(vgetq_lane_s64(v_qi12, 0));
+        if (m2) sum += static_cast<int64>(m2) * PieceType::eval(vgetq_lane_s64(v_qi12, 1));
+        if (m3) sum += static_cast<int64>(m3) * PieceType::eval(vgetq_lane_s64(v_qi34, 0));
+        if (m4) sum += static_cast<int64>(m4) * PieceType::eval(vgetq_lane_s64(v_qi34, 1));
+        if (m5) sum += static_cast<int64>(m5) * PieceType::eval(vgetq_lane_s64(v_qi56, 0));
+        if (m6) sum += static_cast<int64>(m6) * PieceType::eval(vgetq_lane_s64(v_qi56, 1));
+        if (m7) sum += static_cast<int64>(m7) * PieceType::eval(vgetq_lane_s64(v_qi78, 0));
+        if (m8) sum += static_cast<int64>(m8) * PieceType::eval(vgetq_lane_s64(v_qi78, 1));
     }
     for (; m < m_end; ++m) {
         int64 j1 = 6 * m + 1; int64 j2 = 6 * m + 5;
@@ -377,8 +429,9 @@ public:
      * Dynamically chooses optimal balance parameter cx based on hardware SIMD and memory characteristics.
      */
     static inline double choose_cx(int64 X) noexcept {
-        if (X >= 1000000000000000LL) return 1.15;
-        if (X >= 10000000000000LL) return 0.95;
+        if (X >= 1000000000000000LL) return 1.35;
+        if (X >= 10000000000000LL) return 1.15;
+        if (X >= 100000000000LL) return 0.95;
         return 0.70;
     }
 
@@ -388,7 +441,7 @@ public:
     static inline int64 choose_sieve_limit(int64 X, int threads) {
         (void)threads;
         if (X <= 50000000LL) {
-            return X; // Direct linear sieve for X <= 50M
+            return X; // Direct sieve table for X <= 50M
         }
 
         double loglogX = std::log(std::max(2.0, std::log(static_cast<double>(X))));
@@ -423,7 +476,7 @@ public:
 #endif
         );
 
-        if (X <= 50000000LL) {
+        if (X <= 100000LL) {
             int64 u = X;
             int half_u = static_cast<int>((u + 1) / 2);
             std::vector<int8_t> mu_odd(half_u + 1, 0);
@@ -454,16 +507,19 @@ public:
         }
 
         int64 u = choose_sieve_limit(X, threads);
+        const double cx = choose_cx(X);
+        const int64 N = X / u;
 
-        // Precompute sieve table
-        SieveTable table(u, threads);
+        int64 A_max = static_cast<int64>(cx * std::sqrt(static_cast<double>(X))) + 1000;
+        int64 mu_limit = std::max(A_max, N + 1000);
+
+        // Precompute sieve table (with compact mu limit)
+        SieveTable table(u, threads, (X <= u ? 0 : mu_limit));
 
         if (X <= u) {
             return table.get_M(X);
         }
 
-        const double cx = choose_cx(X);
-        const int64 N = X / u;
         const int16_t* __restrict M_ptr = table.data();
         const int8_t* __restrict mu_ptr = table.mu.data();
 
@@ -471,23 +527,31 @@ public:
         int64 n3 = N / 3;
         int64 n2 = N / 2;
 
-        std::vector<int64> k_p1; // k <= N/6: S(y) - S(y/2) - S(y/3) + S(y/6)
-        std::vector<int64> k_p2; // N/6 < k <= N/3: S(y) - S(y/2) - S(y/3)
-        std::vector<int64> k_p3; // N/3 < k <= N/2: S(y) - S(y/2)
-        std::vector<int64> k_p4; // N/2 < k <= N: S(y)
+        // ---------------------------------------------------------------------------
+        // Build unified term list (merges all 4 ranges into a single dispatch vector)
+        // ---------------------------------------------------------------------------
+        struct KTerm { int64 k; int8_t mu_k; uint8_t range; };
+        std::vector<KTerm> terms;
+        terms.reserve(static_cast<size_t>(N * 2 / 3));
 
         for (int64 k = 1; k <= N; ++k) {
             if (k % 2 == 0 || k % 3 == 0) continue;
-            if (mu_ptr[k] != 0) {
-                if (k <= n6) k_p1.push_back(k);
-                else if (k <= n3) k_p2.push_back(k);
-                else if (k <= n2) k_p3.push_back(k);
-                else k_p4.push_back(k);
-            }
+            int8_t mk = mu_ptr[k];
+            if (mk == 0) continue;
+            uint8_t range;
+            if (k <= n6) range = 1;
+            else if (k <= n3) range = 2;
+            else if (k <= n2) range = 3;
+            else range = 4;
+            terms.push_back({k, mk, range});
         }
 
         int64 total_M = 0;
 
+        // ---------------------------------------------------------------------------
+        // Optimized S1: NEON 8-way unrolled with pure SIMD increments and vcvtq.
+        // Used by eval_single_S (Range 4 + parts of Range 2).
+        // ---------------------------------------------------------------------------
         auto eval_single_S = [&](int64 y) noexcept -> int64 {
             int64 A = static_cast<int64>(cx * std::sqrt(static_cast<double>(y)));
             if (A >= y) A = y - 1;
@@ -497,13 +561,53 @@ public:
             int64 S1 = 0;
             int64 start_n = y / u + 1;
             double dy = static_cast<double>(y);
-            for (int64 n = start_n; n <= kappa_y; ++n) {
+            int64 n = start_n;
+
+#if defined(__ARM_NEON)
+            float64x2_t v_dy = vdupq_n_f64(dy);
+            float64x2_t v_step8 = {8.0, 8.0};
+            float64x2_t v_n1 = {static_cast<double>(n),     static_cast<double>(n + 1)};
+            float64x2_t v_n2 = {static_cast<double>(n + 2), static_cast<double>(n + 3)};
+            float64x2_t v_n3 = {static_cast<double>(n + 4), static_cast<double>(n + 5)};
+            float64x2_t v_n4 = {static_cast<double>(n + 6), static_cast<double>(n + 7)};
+
+            for (; n + 7 <= kappa_y; n += 8) {
+                float64x2_t v_q1 = vdivq_f64(v_dy, v_n1);
+                float64x2_t v_q2 = vdivq_f64(v_dy, v_n2);
+                float64x2_t v_q3 = vdivq_f64(v_dy, v_n3);
+                float64x2_t v_q4 = vdivq_f64(v_dy, v_n4);
+
+                v_n1 = vaddq_f64(v_n1, v_step8);
+                v_n2 = vaddq_f64(v_n2, v_step8);
+                v_n3 = vaddq_f64(v_n3, v_step8);
+                v_n4 = vaddq_f64(v_n4, v_step8);
+
+                int64x2_t v_qi1 = vcvtq_s64_f64(v_q1);
+                int64x2_t v_qi2 = vcvtq_s64_f64(v_q2);
+                int64x2_t v_qi3 = vcvtq_s64_f64(v_q3);
+                int64x2_t v_qi4 = vcvtq_s64_f64(v_q4);
+
+                S1 += M_ptr[vgetq_lane_s64(v_qi1, 0)]
+                    + M_ptr[vgetq_lane_s64(v_qi1, 1)]
+                    + M_ptr[vgetq_lane_s64(v_qi2, 0)]
+                    + M_ptr[vgetq_lane_s64(v_qi2, 1)]
+                    + M_ptr[vgetq_lane_s64(v_qi3, 0)]
+                    + M_ptr[vgetq_lane_s64(v_qi3, 1)]
+                    + M_ptr[vgetq_lane_s64(v_qi4, 0)]
+                    + M_ptr[vgetq_lane_s64(v_qi4, 1)];
+            }
+#endif
+            for (; n <= kappa_y; ++n) {
                 S1 += M_ptr[static_cast<int64>(dy / static_cast<double>(n))];
             }
+
             int64 S2 = eval_s2_single(y, A, mu_ptr);
             return 1 - S1 + kappa_y * static_cast<int64>(M_ptr[A]) - S2;
         };
 
+        // ---------------------------------------------------------------------------
+        // Optimized eval_comb2: 8-way NEON S1 and even-n loops with pure SIMD increments.
+        // ---------------------------------------------------------------------------
         auto eval_comb2 = [&](int64 y, int64 y2) noexcept -> int64 {
             int64 A = static_cast<int64>(cx * std::sqrt(static_cast<double>(y)));
             int64 B = static_cast<int64>(cx * std::sqrt(static_cast<double>(y2)));
@@ -525,40 +629,121 @@ public:
 
 #if defined(__ARM_NEON)
             float64x2_t v_dy = vdupq_n_f64(dy);
-            for (; n + 15 <= kappa_y; n += 8) {
-                int64 n_pref = n + 16;
-                int64 q_p0 = static_cast<int64>(dy / static_cast<double>(n_pref));
-                int64 q_p1 = static_cast<int64>(dy / static_cast<double>(n_pref + 4));
-                __builtin_prefetch(&M_ptr[q_p0], 0, 3);
-                __builtin_prefetch(&M_ptr[q_p1], 0, 3);
+            float64x2_t v_step16 = {16.0, 16.0};
+            float64x2_t v_n1 = {static_cast<double>(n),      static_cast<double>(n + 2)};
+            float64x2_t v_n2 = {static_cast<double>(n + 4),  static_cast<double>(n + 6)};
+            float64x2_t v_n3 = {static_cast<double>(n + 8),  static_cast<double>(n + 10)};
+            float64x2_t v_n4 = {static_cast<double>(n + 12), static_cast<double>(n + 14)};
 
-                float64x2_t v_n1 = {static_cast<double>(n), static_cast<double>(n + 2)};
-                float64x2_t v_n2 = {static_cast<double>(n + 4), static_cast<double>(n + 6)};
+            for (; n + 15 <= kappa_y; n += 16) {
                 float64x2_t v_q1 = vdivq_f64(v_dy, v_n1);
                 float64x2_t v_q2 = vdivq_f64(v_dy, v_n2);
+                float64x2_t v_q3 = vdivq_f64(v_dy, v_n3);
+                float64x2_t v_q4 = vdivq_f64(v_dy, v_n4);
 
-                int64 q0 = static_cast<int64>(vgetq_lane_f64(v_q1, 0));
-                int64 q1 = static_cast<int64>(vgetq_lane_f64(v_q1, 1));
-                int64 q2 = static_cast<int64>(vgetq_lane_f64(v_q2, 0));
-                int64 q3 = static_cast<int64>(vgetq_lane_f64(v_q2, 1));
+                v_n1 = vaddq_f64(v_n1, v_step16);
+                v_n2 = vaddq_f64(v_n2, v_step16);
+                v_n3 = vaddq_f64(v_n3, v_step16);
+                v_n4 = vaddq_f64(v_n4, v_step16);
 
-                S1_diff += M_ptr[q0] + M_ptr[q1] + M_ptr[q2] + M_ptr[q3];
+                int64x2_t v_qi1 = vcvtq_s64_f64(v_q1);
+                int64x2_t v_qi2 = vcvtq_s64_f64(v_q2);
+                int64x2_t v_qi3 = vcvtq_s64_f64(v_q3);
+                int64x2_t v_qi4 = vcvtq_s64_f64(v_q4);
+
+                S1_diff += M_ptr[vgetq_lane_s64(v_qi1, 0)]
+                         + M_ptr[vgetq_lane_s64(v_qi1, 1)]
+                         + M_ptr[vgetq_lane_s64(v_qi2, 0)]
+                         + M_ptr[vgetq_lane_s64(v_qi2, 1)]
+                         + M_ptr[vgetq_lane_s64(v_qi3, 0)]
+                         + M_ptr[vgetq_lane_s64(v_qi3, 1)]
+                         + M_ptr[vgetq_lane_s64(v_qi4, 0)]
+                         + M_ptr[vgetq_lane_s64(v_qi4, 1)];
             }
 #endif
             for (; n <= kappa_y; n += 2) {
                 S1_diff += M_ptr[static_cast<int64>(dy / static_cast<double>(n))];
             }
 
+            // ---------------------------------------------------------------------------
+            // Even-n correction: pure SIMD increments and vcvtq
+            // ---------------------------------------------------------------------------
             if (two_kappa_y2 > kappa_y) {
                 int64 start_even = kappa_y + 1;
                 if (start_even % 2 != 0) ++start_even;
-                for (int64 ne = start_even; ne <= two_kappa_y2; ne += 2) {
+                int64 ne = start_even;
+#if defined(__ARM_NEON)
+                float64x2_t v_ne1 = {static_cast<double>(ne),      static_cast<double>(ne + 2)};
+                float64x2_t v_ne2 = {static_cast<double>(ne + 4),  static_cast<double>(ne + 6)};
+                float64x2_t v_ne3 = {static_cast<double>(ne + 8),  static_cast<double>(ne + 10)};
+                float64x2_t v_ne4 = {static_cast<double>(ne + 12), static_cast<double>(ne + 14)};
+
+                for (; ne + 15 <= two_kappa_y2; ne += 16) {
+                    float64x2_t v_qe1 = vdivq_f64(v_dy, v_ne1);
+                    float64x2_t v_qe2 = vdivq_f64(v_dy, v_ne2);
+                    float64x2_t v_qe3 = vdivq_f64(v_dy, v_ne3);
+                    float64x2_t v_qe4 = vdivq_f64(v_dy, v_ne4);
+
+                    v_ne1 = vaddq_f64(v_ne1, v_step16);
+                    v_ne2 = vaddq_f64(v_ne2, v_step16);
+                    v_ne3 = vaddq_f64(v_ne3, v_step16);
+                    v_ne4 = vaddq_f64(v_ne4, v_step16);
+
+                    int64x2_t v_qei1 = vcvtq_s64_f64(v_qe1);
+                    int64x2_t v_qei2 = vcvtq_s64_f64(v_qe2);
+                    int64x2_t v_qei3 = vcvtq_s64_f64(v_qe3);
+                    int64x2_t v_qei4 = vcvtq_s64_f64(v_qe4);
+
+                    S1_diff -= M_ptr[vgetq_lane_s64(v_qei1, 0)]
+                             + M_ptr[vgetq_lane_s64(v_qei1, 1)]
+                             + M_ptr[vgetq_lane_s64(v_qei2, 0)]
+                             + M_ptr[vgetq_lane_s64(v_qei2, 1)]
+                             + M_ptr[vgetq_lane_s64(v_qei3, 0)]
+                             + M_ptr[vgetq_lane_s64(v_qei3, 1)]
+                             + M_ptr[vgetq_lane_s64(v_qei4, 0)]
+                             + M_ptr[vgetq_lane_s64(v_qei4, 1)];
+                }
+#endif
+                for (; ne <= two_kappa_y2; ne += 2) {
                     S1_diff -= M_ptr[static_cast<int64>(dy / static_cast<double>(ne))];
                 }
             } else if (two_kappa_y2 < kappa_y) {
                 int64 start_even = two_kappa_y2 + 1;
                 if (start_even % 2 != 0) ++start_even;
-                for (int64 ne = start_even; ne <= kappa_y; ne += 2) {
+                int64 ne = start_even;
+#if defined(__ARM_NEON)
+                float64x2_t v_ne1 = {static_cast<double>(ne),      static_cast<double>(ne + 2)};
+                float64x2_t v_ne2 = {static_cast<double>(ne + 4),  static_cast<double>(ne + 6)};
+                float64x2_t v_ne3 = {static_cast<double>(ne + 8),  static_cast<double>(ne + 10)};
+                float64x2_t v_ne4 = {static_cast<double>(ne + 12), static_cast<double>(ne + 14)};
+
+                for (; ne + 15 <= kappa_y; ne += 16) {
+                    float64x2_t v_qe1 = vdivq_f64(v_dy, v_ne1);
+                    float64x2_t v_qe2 = vdivq_f64(v_dy, v_ne2);
+                    float64x2_t v_qe3 = vdivq_f64(v_dy, v_ne3);
+                    float64x2_t v_qe4 = vdivq_f64(v_dy, v_ne4);
+
+                    v_ne1 = vaddq_f64(v_ne1, v_step16);
+                    v_ne2 = vaddq_f64(v_ne2, v_step16);
+                    v_ne3 = vaddq_f64(v_ne3, v_step16);
+                    v_ne4 = vaddq_f64(v_ne4, v_step16);
+
+                    int64x2_t v_qei1 = vcvtq_s64_f64(v_qe1);
+                    int64x2_t v_qei2 = vcvtq_s64_f64(v_qe2);
+                    int64x2_t v_qei3 = vcvtq_s64_f64(v_qe3);
+                    int64x2_t v_qei4 = vcvtq_s64_f64(v_qe4);
+
+                    S1_diff += M_ptr[vgetq_lane_s64(v_qei1, 0)]
+                             + M_ptr[vgetq_lane_s64(v_qei1, 1)]
+                             + M_ptr[vgetq_lane_s64(v_qei2, 0)]
+                             + M_ptr[vgetq_lane_s64(v_qei2, 1)]
+                             + M_ptr[vgetq_lane_s64(v_qei3, 0)]
+                             + M_ptr[vgetq_lane_s64(v_qei3, 1)]
+                             + M_ptr[vgetq_lane_s64(v_qei4, 0)]
+                             + M_ptr[vgetq_lane_s64(v_qei4, 1)];
+                }
+#endif
+                for (; ne <= kappa_y; ne += 2) {
                     S1_diff += M_ptr[static_cast<int64>(dy / static_cast<double>(ne))];
                 }
             }
@@ -567,43 +752,24 @@ public:
             return -S1_diff + (kappa_y * static_cast<int64>(M_ptr[A]) - kappa_y2 * static_cast<int64>(M_ptr[B])) - S2_diff;
         };
 
-        // Range 1: k <= N/6 -> (S(y) - S(y/2)) - (S(y/3) - S(y/6))
-        #pragma omp parallel for reduction(+:total_M) schedule(guided) num_threads(threads)
-        for (size_t i = 0; i < k_p1.size(); ++i) {
-            int64 k = k_p1[i];
-            int8_t mu_k = mu_ptr[k];
+        // ---------------------------------------------------------------------------
+        // Single merged parallel loop with dynamic scheduling.
+        // ---------------------------------------------------------------------------
+        #pragma omp parallel for reduction(+:total_M) schedule(dynamic, 64) num_threads(threads)
+        for (size_t i = 0; i < terms.size(); ++i) {
+            int64 k = terms[i].k;
+            int8_t mu_k = terms[i].mu_k;
+            uint8_t range = terms[i].range;
             int64 y = X / k;
-            int64 term = eval_comb2(y, y / 2) - eval_comb2(y / 3, y / 6);
-            total_M += static_cast<int64>(mu_k) * term;
-        }
+            int64 term;
 
-        // Range 2: N/6 < k <= N/3 -> (S(y) - S(y/2)) - S(y/3)
-        #pragma omp parallel for reduction(+:total_M) schedule(guided) num_threads(threads)
-        for (size_t i = 0; i < k_p2.size(); ++i) {
-            int64 k = k_p2[i];
-            int8_t mu_k = mu_ptr[k];
-            int64 y = X / k;
-            int64 term = eval_comb2(y, y / 2) - eval_single_S(y / 3);
-            total_M += static_cast<int64>(mu_k) * term;
-        }
+            switch (range) {
+                case 1: term = eval_comb2(y, y / 2) - eval_comb2(y / 3, y / 6); break;
+                case 2: term = eval_comb2(y, y / 2) - eval_single_S(y / 3); break;
+                case 3: term = eval_comb2(y, y / 2); break;
+                default: term = eval_single_S(y); break;
+            }
 
-        // Range 3: N/3 < k <= N/2 -> S(y) - S(y/2)
-        #pragma omp parallel for reduction(+:total_M) schedule(guided) num_threads(threads)
-        for (size_t i = 0; i < k_p3.size(); ++i) {
-            int64 k = k_p3[i];
-            int8_t mu_k = mu_ptr[k];
-            int64 y = X / k;
-            int64 term = eval_comb2(y, y / 2);
-            total_M += static_cast<int64>(mu_k) * term;
-        }
-
-        // Range 4: N/2 < k <= N -> S(y)
-        #pragma omp parallel for reduction(+:total_M) schedule(guided) num_threads(threads)
-        for (size_t i = 0; i < k_p4.size(); ++i) {
-            int64 k = k_p4[i];
-            int8_t mu_k = mu_ptr[k];
-            int64 y = X / k;
-            int64 term = eval_single_S(y);
             total_M += static_cast<int64>(mu_k) * term;
         }
 
