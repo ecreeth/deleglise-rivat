@@ -197,6 +197,92 @@ inline int8_t mu_from_odd(int64 n, const int8_t* __restrict__ mu_odd) noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// Log-weight segmented Mobius sieve (division-free inner loops, Hurst-style)
+// Stores sum of ceil(log2 p)|1 per hit + square flag; finalizes via
+// comparison with floor(log2 n). Eliminates rem[] divisions and 1MB/block
+// rem traffic. Max weight sum for u<=8B is <50, fits uint8.
+// ---------------------------------------------------------------------------
+inline int clog2_int(int p) noexcept {
+    return 64 - __builtin_clzll((unsigned long long)(p - 1));
+}
+inline int flog2_64(int64 n) noexcept {
+    return 63 - __builtin_clzll((unsigned long long)n);
+}
+inline void sieve_mu_odd_log(int8_t* __restrict__ mu_odd, int64 half_u, int64 u,
+                             int threads) {
+    int sqrt_u = static_cast<int>(std::sqrt(static_cast<double>(u))) + 1;
+    std::vector<int> primes;
+    std::vector<uint8_t> is_p(static_cast<size_t>(sqrt_u) + 1, 1);
+    for (int64 i = 2; i <= sqrt_u; ++i) {
+        if (is_p[static_cast<size_t>(i)]) {
+            if (i > 71) primes.push_back(static_cast<int>(i));
+            if (i * i <= sqrt_u) for (int64 j = i * i; j <= sqrt_u; j += i) is_p[static_cast<size_t>(j)] = 0;
+        }
+    }
+    mu_odd[0] = 0;
+    const int64 BLOCK = 131072;
+    int64 num_blocks = (half_u + BLOCK - 1) / BLOCK;
+    const int small_arr[19] = {3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71};
+    int wsmall[19];
+    for (int i = 0; i < 19; ++i) wsmall[i] = clog2_int(small_arr[i]) | 1;
+    std::vector<int> wprime(primes.size());
+    for (size_t i = 0; i < primes.size(); ++i) wprime[i] = clog2_int(primes[i]) | 1;
+
+    #pragma omp parallel num_threads(threads)
+    {
+        std::vector<uint8_t> lg(static_cast<size_t>(BLOCK));
+        std::vector<uint8_t> is_zero(static_cast<size_t>(BLOCK));
+        #pragma omp for schedule(dynamic, 4)
+        for (int64 b = 0; b < num_blocks; ++b) {
+            int64 low_idx = b * BLOCK + 1;
+            int64 high_idx = std::min(half_u, (b + 1) * BLOCK);
+            int64 len = high_idx - low_idx + 1;
+            if (len <= 0) continue;
+            memset(lg.data(), 0, static_cast<size_t>(len));
+            memset(is_zero.data(), 0, static_cast<size_t>(len));
+            int64 low_val = 2 * low_idx - 1;
+            for (int s = 0; s < 19; ++s) {
+                int64 P = small_arr[s];
+                int64 P2 = P * P;
+                int w = wsmall[s];
+                int64 start = ((low_val + P - 1) / P) * P;
+                if ((start & 1) == 0) start += P;
+                int64 si = (start - low_val) / 2;
+                for (int64 i = si; i < len; i += P) lg[static_cast<size_t>(i)] += static_cast<uint8_t>(w);
+                int64 start2 = ((low_val + P2 - 1) / P2) * P2;
+                if ((start2 & 1) == 0) start2 += P2;
+                int64 si2 = (start2 - low_val) / 2;
+                for (int64 i = si2; i < len; i += P2) is_zero[static_cast<size_t>(i)] = 1;
+            }
+            for (size_t pi = 0; pi < primes.size(); ++pi) {
+                int64 P = primes[pi];
+                int64 P2 = P * P;
+                int w = wprime[pi];
+                int64 start = ((low_val + P - 1) / P) * P;
+                if ((start & 1) == 0) start += P;
+                int64 si = (start - low_val) / 2;
+                if (si >= len) continue;
+                for (int64 i = si; i < len; i += P) lg[static_cast<size_t>(i)] += static_cast<uint8_t>(w);
+                int64 start2 = ((low_val + P2 - 1) / P2) * P2;
+                if ((start2 & 1) == 0) start2 += P2;
+                int64 si2 = (start2 - low_val) / 2;
+                for (int64 i = si2; i < len; i += P2) is_zero[static_cast<size_t>(i)] = 1;
+            }
+            int8_t* out = &mu_odd[low_idx];
+            for (int64 i = 0; i < len; ++i) {
+                if (is_zero[static_cast<size_t>(i)]) { out[i] = 0; continue; }
+                int64 n = low_val + 2 * i;
+                if (n == 1) { out[i] = 1; continue; }
+                uint8_t S = lg[static_cast<size_t>(i)];
+                int fl = flog2_64(n);
+                if (S > static_cast<uint8_t>(fl)) out[i] = (S & 1) ? (int8_t)-1 : (int8_t)1;
+                else out[i] = (S & 1) ? (int8_t)1 : (int8_t)-1;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Original SieveTable (for moderate X values, u <= 600M)
 // ---------------------------------------------------------------------------
 
@@ -249,9 +335,9 @@ private:
     void build_sieve(int threads) {
         int64 half_u = (u + 1) / 2;
 
-        // 1. Sieve mu_odd
+        // 1. Sieve mu_odd (log-weight, division-free)
         std::vector<int8_t> mu_odd(static_cast<size_t>(half_u + 1), 0);
-        sieve_mu_odd(mu_odd.data(), half_u, u, threads);
+        sieve_mu_odd_log(mu_odd.data(), half_u, u, threads);
         const int8_t* __restrict__ mu_odd_ptr = mu_odd.data();
 
         // 2. Populate small mu table (only up to mu_limit)
@@ -431,7 +517,7 @@ private:
     void build(int threads) {
         int64 half_u_total = (u_total + 1) / 2;
         std::vector<int8_t> mu_odd(static_cast<size_t>(half_u_total + 64), 0);
-        sieve_mu_odd(mu_odd.data(), half_u_total, u_total, threads);
+        sieve_mu_odd_log(mu_odd.data(), half_u_total, u_total, threads);
         const int8_t* __restrict__ mu_odd_ptr = mu_odd.data();
 
         // -------------------------------------------------------------------
@@ -576,26 +662,28 @@ struct SinglePiece4 { static inline int64 eval(int64 q) noexcept { return q; } }
  * Branchless, Modulo-Free, NEON 4-Way Pipelined S2 Interval Runner with LUT Summand.
  */
 template <typename PieceType>
-inline int64 run_s2_fast(int64 j_start, int64 j_end, double dy, const int8_t* __restrict mu_ptr) noexcept {
+inline int64 run_s2_fast(int64 j_start, int64 j_end, int64 y, double dy, const int8_t* __restrict mu_ptr) noexcept {
     if (j_start > j_end) return 0;
     int64 sum = 0;
 
     int64 m_start = (j_start + 5) / 6;
     int64 m_end = j_end / 6;
 
-    // Head Boundary
+    // Head Boundary — exact via fast_div guard (>2^53 uses integer division)
     int64 head_end = std::min(j_end, m_start * 6);
     for (int64 j = j_start; j <= head_end; ++j) {
         if (j % 2 != 0 && j % 3 != 0) {
             int8_t m = mu_ptr[j];
             if (m != 0) {
-                int64 q = static_cast<int64>(dy / static_cast<double>(j));
+                int64 q = fast_div(y, dy, j);
                 sum += static_cast<int64>(m) * PieceType::eval(q);
             }
         }
     }
 
+    const bool large_y = (y > 9007199254740992LL);
 #if defined(__ARM_NEON)
+    if (!large_y) {
     float64x2_t v_dy = vdupq_n_f64(dy);
     float64x2_t v_step24 = {24.0, 24.0};
     int64 m = m_start;
@@ -639,15 +727,23 @@ inline int64 run_s2_fast(int64 j_start, int64 j_end, double dy, const int8_t* __
     for (; m < m_end; ++m) {
         int64 j1 = 6 * m + 1; int64 j2 = 6 * m + 5;
         int8_t m1 = mu_ptr[j1]; int8_t m2 = mu_ptr[j2];
-        if (m1) sum += static_cast<int64>(m1) * PieceType::eval(static_cast<int64>(dy / static_cast<double>(j1)));
-        if (m2) sum += static_cast<int64>(m2) * PieceType::eval(static_cast<int64>(dy / static_cast<double>(j2)));
+        if (m1) sum += static_cast<int64>(m1) * PieceType::eval(fast_div(y, dy, j1));
+        if (m2) sum += static_cast<int64>(m2) * PieceType::eval(fast_div(y, dy, j2));
+    }
+    } else {
+    for (int64 m = m_start; m < m_end; ++m) {
+        int64 j1 = 6 * m + 1; int64 j2 = 6 * m + 5;
+        int8_t m1 = mu_ptr[j1]; int8_t m2 = mu_ptr[j2];
+        if (m1) sum += static_cast<int64>(m1) * PieceType::eval(y / j1);
+        if (m2) sum += static_cast<int64>(m2) * PieceType::eval(y / j2);
+    }
     }
 #else
     for (int64 m = m_start; m < m_end; ++m) {
         int64 j1 = 6 * m + 1; int64 j2 = 6 * m + 5;
         int8_t m1 = mu_ptr[j1]; int8_t m2 = mu_ptr[j2];
-        if (m1) sum += static_cast<int64>(m1) * PieceType::eval(static_cast<int64>(dy / static_cast<double>(j1)));
-        if (m2) sum += static_cast<int64>(m2) * PieceType::eval(static_cast<int64>(dy / static_cast<double>(j2)));
+        if (m1) sum += static_cast<int64>(m1) * PieceType::eval(fast_div(y, dy, j1));
+        if (m2) sum += static_cast<int64>(m2) * PieceType::eval(fast_div(y, dy, j2));
     }
 #endif
 
@@ -657,7 +753,7 @@ inline int64 run_s2_fast(int64 j_start, int64 j_end, double dy, const int8_t* __
         if (j % 2 != 0 && j % 3 != 0) {
             int8_t m = mu_ptr[j];
             if (m != 0) {
-                int64 q = static_cast<int64>(dy / static_cast<double>(j));
+                int64 q = fast_div(y, dy, j);
                 sum += static_cast<int64>(m) * PieceType::eval(q);
             }
         }
@@ -679,14 +775,14 @@ inline int64 eval_s2_combined(int64 y, int64 A, int64 B, const int8_t* __restric
     int64 a2 = A / 2;
 
     int64 sum = 0;
-    sum += run_s2_fast<Piece1>(1, b6, dy, mu_ptr);
-    sum += run_s2_fast<Piece2>(b6 + 1, a6, dy, mu_ptr);
-    sum += run_s2_fast<Piece3>(a6 + 1, b3, dy, mu_ptr);
-    sum += run_s2_fast<Piece4>(b3 + 1, a3, dy, mu_ptr);
-    sum += run_s2_fast<Piece5>(a3 + 1, b2, dy, mu_ptr);
-    sum += run_s2_fast<Piece6>(b2 + 1, a2, dy, mu_ptr);
-    sum += run_s2_fast<Piece7>(a2 + 1, B, dy, mu_ptr);
-    sum += run_s2_fast<Piece8>(B + 1, A, dy, mu_ptr);
+    sum += run_s2_fast<Piece1>(1, b6, y, dy, mu_ptr);
+    sum += run_s2_fast<Piece2>(b6 + 1, a6, y, dy, mu_ptr);
+    sum += run_s2_fast<Piece3>(a6 + 1, b3, y, dy, mu_ptr);
+    sum += run_s2_fast<Piece4>(b3 + 1, a3, y, dy, mu_ptr);
+    sum += run_s2_fast<Piece5>(a3 + 1, b2, y, dy, mu_ptr);
+    sum += run_s2_fast<Piece6>(b2 + 1, a2, y, dy, mu_ptr);
+    sum += run_s2_fast<Piece7>(a2 + 1, B, y, dy, mu_ptr);
+    sum += run_s2_fast<Piece8>(B + 1, A, y, dy, mu_ptr);
 
     return sum;
 }
@@ -701,10 +797,10 @@ inline int64 eval_s2_single(int64 y, int64 A, const int8_t* __restrict mu_ptr) n
     int64 a2 = A / 2;
 
     int64 sum = 0;
-    sum += run_s2_fast<SinglePiece1>(1, a6, dy, mu_ptr);
-    sum += run_s2_fast<SinglePiece2>(a6 + 1, a3, dy, mu_ptr);
-    sum += run_s2_fast<SinglePiece3>(a3 + 1, a2, dy, mu_ptr);
-    sum += run_s2_fast<SinglePiece4>(a2 + 1, A, dy, mu_ptr);
+    sum += run_s2_fast<SinglePiece1>(1, a6, y, dy, mu_ptr);
+    sum += run_s2_fast<SinglePiece2>(a6 + 1, a3, y, dy, mu_ptr);
+    sum += run_s2_fast<SinglePiece3>(a3 + 1, a2, y, dy, mu_ptr);
+    sum += run_s2_fast<SinglePiece4>(a2 + 1, A, y, dy, mu_ptr);
 
     return sum;
 }
@@ -721,9 +817,9 @@ public:
      */
     static inline double choose_cx(int64 X, bool compressed = false) noexcept {
         (void)compressed;
-        if (X >= 1000000000000000LL) return 0.95;
-        if (X >= 10000000000000LL) return 0.95;
-        if (X >= 100000000000LL) return 0.95;
+        if (X >= 1000000000000000LL) return 1.5;
+        if (X >= 10000000000000LL) return 1.5;
+        if (X >= 100000000000LL) return 1.5;
         return 0.70;
     }
 
@@ -873,26 +969,26 @@ public:
 
             int64 split_n = std::min(kappa_y, (u_dense > 0 ? y / u_dense : kappa_y));
 
-            // Compressed range (q > u_dense)
+            // Compressed range (q > u_dense) — exact via fast_div guard (>2^53 uses integer)
             for (int64 n = start_n; n <= split_n; ++n) {
-                int64 q = static_cast<int64>(dy / static_cast<double>(n));
+                int64 q = fast_div(y, dy, n);
                 S1 += table.reconstruct_compressed(q);
             }
 
             // Dense range (q <= u_dense): fast 8-way unrolled direct array reads
             int64 n = std::max(start_n, split_n + 1);
             for (; n + 7 <= kappa_y; n += 8) {
-                S1 += M_dense[static_cast<int64>(dy / static_cast<double>(n))]
-                    + M_dense[static_cast<int64>(dy / static_cast<double>(n + 1))]
-                    + M_dense[static_cast<int64>(dy / static_cast<double>(n + 2))]
-                    + M_dense[static_cast<int64>(dy / static_cast<double>(n + 3))]
-                    + M_dense[static_cast<int64>(dy / static_cast<double>(n + 4))]
-                    + M_dense[static_cast<int64>(dy / static_cast<double>(n + 5))]
-                    + M_dense[static_cast<int64>(dy / static_cast<double>(n + 6))]
-                    + M_dense[static_cast<int64>(dy / static_cast<double>(n + 7))];
+                S1 += M_dense[fast_div(y, dy, n)]
+                    + M_dense[fast_div(y, dy, n + 1)]
+                    + M_dense[fast_div(y, dy, n + 2)]
+                    + M_dense[fast_div(y, dy, n + 3)]
+                    + M_dense[fast_div(y, dy, n + 4)]
+                    + M_dense[fast_div(y, dy, n + 5)]
+                    + M_dense[fast_div(y, dy, n + 6)]
+                    + M_dense[fast_div(y, dy, n + 7)];
             }
             for (; n <= kappa_y; ++n) {
-                S1 += M_dense[static_cast<int64>(dy / static_cast<double>(n))];
+                S1 += M_dense[fast_div(y, dy, n)];
             }
 
             int64 S2 = eval_s2_single(y, A, mu_ptr);
@@ -921,23 +1017,23 @@ public:
             // S1 odd loop: compressed tier (q > u_dense)
             int64 n = start_odd;
             for (; n <= split_odd; n += 2) {
-                int64 q = static_cast<int64>(dy / static_cast<double>(n));
+                int64 q = fast_div(y, dy, n);
                 S1_diff += table.reconstruct_compressed(q);
             }
 
             // S1 odd loop: dense tier (q <= u_dense) with 8-way unrolling
             for (; n + 15 <= kappa_y; n += 16) {
-                S1_diff += M_dense[static_cast<int64>(dy / static_cast<double>(n))]
-                         + M_dense[static_cast<int64>(dy / static_cast<double>(n + 2))]
-                         + M_dense[static_cast<int64>(dy / static_cast<double>(n + 4))]
-                         + M_dense[static_cast<int64>(dy / static_cast<double>(n + 6))]
-                         + M_dense[static_cast<int64>(dy / static_cast<double>(n + 8))]
-                         + M_dense[static_cast<int64>(dy / static_cast<double>(n + 10))]
-                         + M_dense[static_cast<int64>(dy / static_cast<double>(n + 12))]
-                         + M_dense[static_cast<int64>(dy / static_cast<double>(n + 14))];
+                S1_diff += M_dense[fast_div(y, dy, n)]
+                         + M_dense[fast_div(y, dy, n + 2)]
+                         + M_dense[fast_div(y, dy, n + 4)]
+                         + M_dense[fast_div(y, dy, n + 6)]
+                         + M_dense[fast_div(y, dy, n + 8)]
+                         + M_dense[fast_div(y, dy, n + 10)]
+                         + M_dense[fast_div(y, dy, n + 12)]
+                         + M_dense[fast_div(y, dy, n + 14)];
             }
             for (; n <= kappa_y; n += 2) {
-                S1_diff += M_dense[static_cast<int64>(dy / static_cast<double>(n))];
+                S1_diff += M_dense[fast_div(y, dy, n)];
             }
 
             // Even-n correction: all quotients <= A < u_dense, direct dense M reads!
@@ -946,34 +1042,34 @@ public:
                 if (start_even % 2 != 0) ++start_even;
                 int64 ne = start_even;
                 for (; ne + 15 <= two_kappa_y2; ne += 16) {
-                    S1_diff -= (M_dense[static_cast<int64>(dy / static_cast<double>(ne))]
-                              + M_dense[static_cast<int64>(dy / static_cast<double>(ne + 2))]
-                              + M_dense[static_cast<int64>(dy / static_cast<double>(ne + 4))]
-                              + M_dense[static_cast<int64>(dy / static_cast<double>(ne + 6))]
-                              + M_dense[static_cast<int64>(dy / static_cast<double>(ne + 8))]
-                              + M_dense[static_cast<int64>(dy / static_cast<double>(ne + 10))]
-                              + M_dense[static_cast<int64>(dy / static_cast<double>(ne + 12))]
-                              + M_dense[static_cast<int64>(dy / static_cast<double>(ne + 14))]);
+                    S1_diff -= (M_dense[fast_div(y, dy, ne)]
+                              + M_dense[fast_div(y, dy, ne + 2)]
+                              + M_dense[fast_div(y, dy, ne + 4)]
+                              + M_dense[fast_div(y, dy, ne + 6)]
+                              + M_dense[fast_div(y, dy, ne + 8)]
+                              + M_dense[fast_div(y, dy, ne + 10)]
+                              + M_dense[fast_div(y, dy, ne + 12)]
+                              + M_dense[fast_div(y, dy, ne + 14)]);
                 }
                 for (; ne <= two_kappa_y2; ne += 2) {
-                    S1_diff -= M_dense[static_cast<int64>(dy / static_cast<double>(ne))];
+                    S1_diff -= M_dense[fast_div(y, dy, ne)];
                 }
             } else if (two_kappa_y2 < kappa_y) {
                 int64 start_even = two_kappa_y2 + 1;
                 if (start_even % 2 != 0) ++start_even;
                 int64 ne = start_even;
                 for (; ne + 15 <= kappa_y; ne += 16) {
-                    S1_diff += (M_dense[static_cast<int64>(dy / static_cast<double>(ne))]
-                              + M_dense[static_cast<int64>(dy / static_cast<double>(ne + 2))]
-                              + M_dense[static_cast<int64>(dy / static_cast<double>(ne + 4))]
-                              + M_dense[static_cast<int64>(dy / static_cast<double>(ne + 6))]
-                              + M_dense[static_cast<int64>(dy / static_cast<double>(ne + 8))]
-                              + M_dense[static_cast<int64>(dy / static_cast<double>(ne + 10))]
-                              + M_dense[static_cast<int64>(dy / static_cast<double>(ne + 12))]
-                              + M_dense[static_cast<int64>(dy / static_cast<double>(ne + 14))]);
+                    S1_diff += (M_dense[fast_div(y, dy, ne)]
+                              + M_dense[fast_div(y, dy, ne + 2)]
+                              + M_dense[fast_div(y, dy, ne + 4)]
+                              + M_dense[fast_div(y, dy, ne + 6)]
+                              + M_dense[fast_div(y, dy, ne + 8)]
+                              + M_dense[fast_div(y, dy, ne + 10)]
+                              + M_dense[fast_div(y, dy, ne + 12)]
+                              + M_dense[fast_div(y, dy, ne + 14)]);
                 }
                 for (; ne <= kappa_y; ne += 2) {
-                    S1_diff += M_dense[static_cast<int64>(dy / static_cast<double>(ne))];
+                    S1_diff += M_dense[fast_div(y, dy, ne)];
                 }
             }
 
