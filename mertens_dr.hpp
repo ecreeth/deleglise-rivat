@@ -21,6 +21,16 @@
 #include <arm_neon.h>
 #endif
 
+// Quotient-loop backend selection.
+// Define MERTENS_USE_NEON_DIV=1 to opt into the NEON 4-way pipelined
+// double-division loops. Default is scalar double division: measured ~6%
+// faster on Apple M1 for M(1e14) because the scalar divider throughput plus
+// out-of-order execution beats explicit NEON vdiv+vcvt once M-table gather
+// latency dominates the loop body.
+#if defined(__ARM_NEON) && defined(MERTENS_USE_NEON_DIV)
+#define MERTENS_NEON_DIV 1
+#endif
+
 namespace mertens_dr {
 
 using int64 = long long;
@@ -80,7 +90,7 @@ inline int8_t mu_from_odd(int64 n, const int8_t* __restrict__ mu_odd) noexcept {
  * Max acc for n<=1.5G is ~40 (<50 for u<=8B), safely below 0x80.
  */
 inline void sieve_mu_odd_byte_log(int8_t* __restrict__ mu_odd, int64 half_u, int64 u,
-                                  int threads) {
+                                   int threads) {
     // 1. Base primes up to sqrt(u)
     // NOTE: i/j must be 64-bit: int i*i overflows past u > 46340^2
     // (~2.147e9), corrupting is_p and segfaulting (found at u=2.4e9).
@@ -100,6 +110,37 @@ inline void sieve_mu_odd_byte_log(int8_t* __restrict__ mu_odd, int64 half_u, int
         }
     }
 
+    // 1b. Small-prime stencil (Hurst 5.2 style): pre-sieved odd weights for
+    // p in {3,5,7,11}. Weight divisibility has value-period lcm(3,5,7,11) =
+    // 1155; restricted to odd values the index period is 1155 entries
+    // (values 2j+1 share residues mod 3,5,7,11 iff j agrees mod 1155, since
+    // 2 is invertible mod 1155). Replaces the four densest weight loops.
+    // Square (p^2) marking stays per-prime for ALL primes: square periods
+    // (25, 49, 121, ...) do not divide any small value period, so folding
+    // flags into the stencil corrupts every block past the first. Flag
+    // dominates at finalize, so weights pre-added on squares are harmless.
+    static const std::vector<int8_t> kOddStencil = []() {
+        constexpr int kLen = 1155;
+        std::vector<int8_t> st(static_cast<size_t>(kLen), 0);
+        const int small_p[4] = {3, 5, 7, 11};
+        uint8_t small_w[4];
+        for (int k = 0; k < 4; ++k)
+            small_w[k] = static_cast<uint8_t>(std::bit_width(static_cast<uint64_t>(small_p[k] - 1)) | 1u);
+        for (int j = 0; j < kLen; ++j) {
+            int v = 2 * j + 1;
+            int acc = 0;
+            for (int k = 0; k < 4; ++k) {
+                if (v % small_p[k] == 0) acc += small_w[k];
+            }
+            st[static_cast<size_t>(j)] = static_cast<int8_t>(acc);
+        }
+        return st;
+    }();
+    // First prime index >= 13 (primes[0..3] = 3,5,7,11 weights via stencil;
+    // their square loops still run below).
+    size_t pi_start = 0;
+    while (pi_start < primes.size() && primes[pi_start] < 13) ++pi_start;
+
     const int64 BLOCK_SIZE = 131072; // 128K byte entries: L2-resident per thread
     int64 num_blocks = (half_u + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
@@ -113,17 +154,29 @@ inline void sieve_mu_odd_byte_log(int8_t* __restrict__ mu_odd, int64 half_u, int
             if (len <= 0) continue;
 
             int8_t* __restrict__ b_mu = &mu_odd[low_idx];
-            std::memset(b_mu, 0, static_cast<size_t>(len));
+            // Stencil fill with phase offset (replaces memset + p<=11 weights).
+            {
+                int64 off = (low_idx - 1) % 1155;
+                int64 done = 0;
+                int64 first = std::min<int64>(len, 1155 - off);
+                std::memcpy(b_mu, kOddStencil.data() + off, static_cast<size_t>(first));
+                done = first;
+                while (done + 1155 <= len) {
+                    std::memcpy(b_mu + done, kOddStencil.data(), 1155);
+                    done += 1155;
+                }
+                if (done < len) {
+                    std::memcpy(b_mu + done, kOddStencil.data(),
+                                static_cast<size_t>(len - done));
+                }
+            }
 
+            // Square marking for ALL primes (square periods exceed the
+            // weight stencil period, so these stay strided).
             for (size_t pi = 0; pi < primes.size(); ++pi) {
                 int64 p = primes[pi];
-                uint8_t w = prime_w[pi];
                 int64 p2 = p * p;
                 int64 low_val = 2 * low_idx - 1;
-
-                int64 start_val = ((low_val + p - 1) / p) * p;
-                if (start_val % 2 == 0) start_val += p;
-                int64 start_i = (start_val - low_val) / 2;
 
                 int64 start_sq_val = ((low_val + p2 - 1) / p2) * p2;
                 if (start_sq_val % 2 == 0) start_sq_val += p2;
@@ -132,6 +185,17 @@ inline void sieve_mu_odd_byte_log(int8_t* __restrict__ mu_odd, int64 half_u, int
                 for (int64 i = start_sq_i; i < len; i += p2) {
                     b_mu[i] |= static_cast<int8_t>(0x80);
                 }
+            }
+
+            // Weight accumulation for p >= 13 (p <= 11 via stencil).
+            for (size_t pi = pi_start; pi < primes.size(); ++pi) {
+                int64 p = primes[pi];
+                uint8_t w = prime_w[pi];
+                int64 low_val = 2 * low_idx - 1;
+
+                int64 start_val = ((low_val + p - 1) / p) * p;
+                if (start_val % 2 == 0) start_val += p;
+                int64 start_i = (start_val - low_val) / 2;
 
                 for (int64 i = start_i; i < len; i += p) {
                     int8_t a = b_mu[i];
@@ -371,7 +435,7 @@ inline int64 run_s2_fast(int64 j_start, int64 j_end, int64 y, double dy, const i
     }
 
     const bool large_y = (y > 9007199254740992LL);
-#if defined(__ARM_NEON)
+#if defined(MERTENS_NEON_DIV)
     if (!large_y) {
     // 4-way NEON pipelined division loop (processes 8 coprime-6 values per step)
     float64x2_t v_dy = vdupq_n_f64(dy);
@@ -890,7 +954,7 @@ public:
             int64 n = start_n;
             const bool large_y = (y > 9007199254740992LL);
 
-#if defined(__ARM_NEON)
+#if defined(MERTENS_NEON_DIV)
             if (!large_y) {
             float64x2_t v_dy = vdupq_n_f64(dy);
             float64x2_t v_step8 = {8.0, 8.0};
@@ -971,7 +1035,7 @@ public:
             int64 n = start_odd;
             const bool large_y = (y > 9007199254740992LL);
 
-#if defined(__ARM_NEON)
+#if defined(MERTENS_NEON_DIV)
             if (!large_y) {
             float64x2_t v_dy = vdupq_n_f64(dy);
             float64x2_t v_step16 = {16.0, 16.0};
@@ -1029,7 +1093,7 @@ public:
                 int64 start_even = kappa_y + 1;
                 if (start_even % 2 != 0) ++start_even;
                 int64 ne = start_even;
-#if defined(__ARM_NEON)
+#if defined(MERTENS_NEON_DIV)
                 if (!large_y) {
                 float64x2_t v_dy = vdupq_n_f64(dy);
                 float64x2_t v_step16 = {16.0, 16.0};
@@ -1082,7 +1146,7 @@ public:
                 int64 start_even = two_kappa_y2 + 1;
                 if (start_even % 2 != 0) ++start_even;
                 int64 ne = start_even;
-#if defined(__ARM_NEON)
+#if defined(MERTENS_NEON_DIV)
                 if (!large_y) {
                 float64x2_t v_dy2 = vdupq_n_f64(dy);
                 float64x2_t v_step16_2 = {16.0, 16.0};
@@ -1139,8 +1203,13 @@ public:
 
         // ---------------------------------------------------------------------------
         // Single merged parallel loop with dynamic scheduling.
+        // Chunk is tunable at compile time (default 64). Smaller chunks
+        // balance the heavy head terms better; larger chunks cut dispatch.
         // ---------------------------------------------------------------------------
-        #pragma omp parallel for reduction(+:total_M) schedule(dynamic, 64) num_threads(threads)
+#ifndef MERTENS_DYN_CHUNK
+#define MERTENS_DYN_CHUNK 64
+#endif
+        #pragma omp parallel for reduction(+:total_M) schedule(dynamic, MERTENS_DYN_CHUNK) num_threads(threads)
         for (long long i = 0; i < static_cast<long long>(terms.size()); ++i) {
             int64 k = terms[i].k;
             int8_t mu_k = terms[i].mu_k;

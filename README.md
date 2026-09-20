@@ -102,22 +102,46 @@ make test-cuda
 
 ### CPU Performance & Comparison vs. Greg Hurst (arXiv:2607.07566)
 
-Measured 2026-09-05 on Apple M1 Mac mini (8T, 16GB) with v2 engine
-(log-weight sieve + `cx=1.5` + `fast_div` exact-quotient guard for `y>2^53`).
+Measured 2026-09-20 on Apple M1 Mac mini (8T, 16GB) with the current engine
+(scalar double-division quotient loops by default with opt-in NEON via
+`MERTENS_USE_NEON_DIV`, small-prime `{3,5,7,11}` sieve stencil, tunable
+OpenMP chunk `MERTENS_DYN_CHUNK=64`). `MERTENS_FX`/`MERTENS_CX` env overrides
+select the sieve balance `fx` and split `cx`; defaults are `fx=0.32`
+(cap 1.5G) and `cx=1.35` ($\ge 10^{15}$) / `1.15` ($\ge 10^{13}$) /
+`0.95` ($\ge 10^{11}$) / `0.70` (below). Best 2026-09-20 tuning on this box
+for $10^{15}$ is `MERTENS_FX=0.2 MERTENS_CX=1.15`. Expect $\pm 10$–$15\%$
+run-to-run variance (frequency ramp / heat soak on Apple Silicon); figures
+below are single-sweep runs with `./bench_dr --benchmark 15 8`.
 
-| Target $X$ | Exact $M(X)$ | Baseline (Apple M1, 8T) | v2 Engine (Apple M1, 8T) | Greg Hurst Preprint (Reported) | Speedup (vs Baseline) |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **$10^8$** | $1,928$ | $0.0021$ s | **$0.0005$ s** | — | **$4.2\times$** |
-| **$10^9$** | $-222$ | $0.0062$ s | **$0.0017$ s** | — | **$3.6\times$** |
-| **$10^{10}$** | $-33,722$ | $0.0151$ s | **$0.0057$ s** | — | **$2.6\times$** |
-| **$10^{11}$** | $-87,856$ | $0.0548$ s | **$0.0161$ s** | — | **$3.4\times$** |
-| **$10^{12}$** | $62,366$ | $0.1030$ s | **$0.0701$ s** | $\sim 0.03$ s (M2 Max) | **$1.5\times$** |
-| **$10^{13}$** | $599,582$ | $0.4500$ s | **$0.3295$ s** | $0.12$ s (M2 Max) | **$1.4\times$** |
-| **$10^{14}$** | $-875,575$ | $2.3370$ s | **$1.5389$ s** | $0.51$ s (M2 Max) | **$1.5\times$** |
-| **$10^{15}$** | $-3,216,373$ | $14.8000$ s | **$9.2860$ s** | $2.10$ s (M2 Max) | **$1.6\times$** |
-| **$10^{16}$** | $-3,195,437$ | $69.6000$ s | **$44.9401$ s** | $2.39$ s (M3 Ultra) | **$1.5\times$** |
+| Target $X$ | Exact $M(X)$ | Baseline (Apple M1, 8T) | Current Engine, default config (Apple M1, 8T) | Tuned `FX=0.2 CX=1.15` (Apple M1, 8T) | Greg Hurst Preprint (Reported) | Speedup (best M1 vs Baseline) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **$10^8$** | $1,928$ | $0.0021$ s | **$0.0004$ s** | **$0.0007$ s** | — | **$3.0\times$** |
+| **$10^9$** | $-222$ | $0.0062$ s | **$0.0008$ s** | **$0.0011$ s** | — | **$5.6\times$** |
+| **$10^{10}$** | $-33,722$ | $0.0151$ s | **$0.0040$ s** | **$0.0044$ s** | — | **$3.4\times$** |
+| **$10^{11}$** | $-87,856$ | $0.0548$ s | **$0.0125$ s** | **$0.0111$ s** | — | **$4.9\times$** |
+| **$10^{12}$** | $62,366$ | $0.1030$ s | **$0.0487$ s** | **$0.0572$ s** | $\sim 0.03$ s (M2 Max) | **$1.8\times$** |
+| **$10^{13}$** | $599,582$ | $0.4500$ s | **$0.2212$ s** | **$0.2526$ s** | $0.12$ s (M2 Max) | **$1.8\times$** |
+| **$10^{14}$** | $-875,575$ | $2.3370$ s | **$1.1768$ s** | **$1.2620$ s** | $0.51$ s (M2 Max) | **$1.9\times$** |
+| **$10^{15}$** | $-3,216,373$ | $14.8000$ s | **$7.7940$ s** | **$7.0379$ s** (best observed $5.88$ s cold) | $2.10$ s (M2 Max) | **$2.1\times$** |
+| **$10^{16}$** | $-3,195,437$ | $69.6000$ s | **$50.4758$ s** | — (not re-run tuned) | $2.39$ s (M3 Ultra) | **$1.4\times$** |
+
+Small inputs (same 2026-09-20 sweep, default vs tuned — tuning is a no-op
+below $u = X$, shown for completeness):
+
+| Target $X$ | Exact $M(X)$ | Default config | Tuned `FX=0.2 CX=1.15` |
+| :--- | :--- | :--- | :--- |
+| **$10^1$** | $-1$ | $0.0006$ s | $0.0006$ s |
+| **$10^2$** | $1$ | $<0.0001$ s | $<0.0001$ s |
+| **$10^3$** | $2$ | $<0.0001$ s | $<0.0001$ s |
+| **$10^4$** | $-23$ | $<0.0001$ s | $<0.0001$ s |
+| **$10^5$** | $-48$ | $0.0003$ s | $0.0003$ s |
+| **$10^6$** | $212$ | $0.0025$ s | $0.0039$ s |
+| **$10^7$** | $1,037$ | $0.0156$ s | $0.0174$ s |
 
 ### NVIDIA Tesla T4 (16GB VRAM, Turing `sm_75` - CUDA Benchmark Sweep)
+
+Retained from the earlier T4 run — not re-measured here (no CUDA-capable
+device on the Apple M1 host used above).
 
 | Target $X$ | Exact $M(X)$ | Sieve Time (s) | H2D Copy (s) | GPU Kernel (s) | Total Time (s) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
