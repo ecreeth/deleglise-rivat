@@ -58,9 +58,24 @@ make test
 # Benchmark sweep from 10^1 to 10^15:
 ./bench_dr --benchmark 15 8
 
+# Median of three runs per input (reduces timing noise):
+./bench_dr --benchmark 15 8 3
+
 # Comparative benchmark vs O(X^(3/4)) Dirichlet DP Engine:
 ./bench_dr --compare 14 8
 ```
+
+On x86-64, the CPU engine uses packed SSE2 division for the S1 and S2
+quotient loops. This requires no extra architecture compiler flag. Define
+`MERTENS_USE_SSE2_DIV=0` to compare with the scalar backend. The dense lookup
+loop retains a scalar fallback for quotients beyond the signed 32-bit index
+range, and numerators above `2^53` retain exact integer division. Other
+architectures keep their existing scalar or optional NEON backend.
+
+Speedup varies by input: small inputs use a direct sieve, while larger inputs
+spend more time in quotient lookups and eventually reach the sieve memory cap.
+Compare repeated runs with the same compiler, thread count, and tuning settings.
+See the [x86-64 comparison and measurement method](benchmarks/cpu-2026-10-19.md).
 
 ---
 

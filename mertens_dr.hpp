@@ -23,12 +23,18 @@
 
 // Quotient-loop backend selection.
 // Define MERTENS_USE_NEON_DIV=1 to opt into the NEON 4-way pipelined
-// double-division loops. Default is scalar double division: measured ~6%
+// double-division loops. On ARM the default is scalar division: measured ~6%
 // faster on Apple M1 for M(1e14) because the scalar divider throughput plus
 // out-of-order execution beats explicit NEON vdiv+vcvt once M-table gather
 // latency dominates the loop body.
 #if defined(__ARM_NEON) && defined(MERTENS_USE_NEON_DIV)
 #define MERTENS_NEON_DIV 1
+#endif
+
+// SSE2 is part of the x86-64 baseline; opt out for comparisons.
+#if (defined(_M_X64) || defined(__x86_64__)) && (!defined(MERTENS_USE_SSE2_DIV) || MERTENS_USE_SSE2_DIV)
+#include <emmintrin.h>
+#define MERTENS_SSE2_DIV 1
 #endif
 
 namespace mertens_dr {
@@ -68,6 +74,48 @@ inline int64 fast_div(int64 y, double dy, int64 d) noexcept {
         return static_cast<int64>(dy / static_cast<double>(d));
     }
 }
+
+#if defined(MERTENS_SSE2_DIV)
+// Dense quotient lookups have 32-bit indices for the default sieve cap.
+// Two packed divides handle four independent indices per iteration.
+template <int Stride>
+inline int64 sum_dense_quotients(int64 y, int64 first, int64 last,
+                                 const int16_t* __restrict__ values) noexcept {
+    static_assert(Stride == 1 || Stride == 2);
+    if (first > last) return 0;
+    const double dy = static_cast<double>(y);
+    int64 sum = 0;
+    int64 n = first;
+    if (y <= 9007199254740992LL && y / first <= INT32_MAX) {
+        const __m128d numerator = _mm_set1_pd(dy);
+        const __m128d step = _mm_set1_pd(4.0 * Stride);
+        __m128d d0 = _mm_set_pd(static_cast<double>(n + Stride), static_cast<double>(n));
+        __m128d d1 = _mm_set_pd(static_cast<double>(n + 3 * Stride), static_cast<double>(n + 2 * Stride));
+        for (; n + 3 * Stride <= last; n += 4 * Stride) {
+            const __m128i q0 = _mm_cvttpd_epi32(_mm_div_pd(numerator, d0));
+            const __m128i q1 = _mm_cvttpd_epi32(_mm_div_pd(numerator, d1));
+            sum += values[_mm_cvtsi128_si32(q0)]
+                 + values[_mm_cvtsi128_si32(_mm_srli_si128(q0, 4))]
+                 + values[_mm_cvtsi128_si32(q1)]
+                 + values[_mm_cvtsi128_si32(_mm_srli_si128(q1, 4))];
+            d0 = _mm_add_pd(d0, step);
+            d1 = _mm_add_pd(d1, step);
+        }
+    }
+    for (; n + 7 * Stride <= last; n += 8 * Stride) {
+        sum += values[fast_div(y, dy, n)]
+             + values[fast_div(y, dy, n + Stride)]
+             + values[fast_div(y, dy, n + 2 * Stride)]
+             + values[fast_div(y, dy, n + 3 * Stride)]
+             + values[fast_div(y, dy, n + 4 * Stride)]
+             + values[fast_div(y, dy, n + 5 * Stride)]
+             + values[fast_div(y, dy, n + 6 * Stride)]
+             + values[fast_div(y, dy, n + 7 * Stride)];
+    }
+    for (; n <= last; n += Stride) sum += values[fast_div(y, dy, n)];
+    return sum;
+}
+#endif
 
 /**
  * Derives mu(n) from odd-only mu table: mu_odd[k] = mu(2k-1).
@@ -496,11 +544,30 @@ inline int64 run_s2_fast(int64 j_start, int64 j_end, int64 y, double dy, const i
     }
     }
 #else
-    for (int64 m = m_start; m < m_end; ++m) {
-        int64 j1 = 6 * m + 1; int64 j2 = 6 * m + 5;
-        int8_t m1 = mu_ptr[j1]; int8_t m2 = mu_ptr[j2];
-        if (m1) sum += static_cast<int64>(m1) * PieceType::eval(fast_div(y, dy, j1));
-        if (m2) sum += static_cast<int64>(m2) * PieceType::eval(fast_div(y, dy, j2));
+#if defined(MERTENS_SSE2_DIV)
+    if (!large_y) {
+        const __m128d numerator = _mm_set1_pd(dy);
+        const __m128d step = _mm_set1_pd(6.0);
+        __m128d divisor = _mm_set_pd(static_cast<double>(6 * m_start + 5),
+                                    static_cast<double>(6 * m_start + 1));
+        for (int64 m = m_start; m < m_end; ++m) {
+            const __m128d q = _mm_div_pd(numerator, divisor);
+            const int64 q1 = _mm_cvttsd_si64(q);
+            const int64 q2 = _mm_cvttsd_si64(_mm_unpackhi_pd(q, q));
+            // Evaluating both lanes avoids a branch for each Mobius byte.
+            sum += static_cast<int64>(mu_ptr[6 * m + 1]) * PieceType::eval(q1)
+                 + static_cast<int64>(mu_ptr[6 * m + 5]) * PieceType::eval(q2);
+            divisor = _mm_add_pd(divisor, step);
+        }
+    } else
+#endif
+    {
+        for (int64 m = m_start; m < m_end; ++m) {
+            int64 j1 = 6 * m + 1; int64 j2 = 6 * m + 5;
+            int8_t m1 = mu_ptr[j1]; int8_t m2 = mu_ptr[j2];
+            if (m1) sum += static_cast<int64>(m1) * PieceType::eval(fast_div(y, dy, j1));
+            if (m2) sum += static_cast<int64>(m2) * PieceType::eval(fast_div(y, dy, j2));
+        }
     }
 #endif
 
@@ -969,8 +1036,11 @@ public:
             }
             }
 #endif
-            // Scalar 8-way unrolled dense reads (local CHMT contribution):
-            // helps large_y and non-NEON builds; exact via fast_div.
+            // Packed x86 dense reads, with the scalar loop retained elsewhere.
+            // The helper preserves integer division for large y.
+#if defined(MERTENS_SSE2_DIV)
+            S1 += sum_dense_quotients<1>(y, n, kappa_y, M_ptr);
+#else
             for (; n + 7 <= kappa_y; n += 8) {
                 S1 += M_ptr[fast_div(y, dy, n)]
                     + M_ptr[fast_div(y, dy, n + 1)]
@@ -984,6 +1054,7 @@ public:
             for (; n <= kappa_y; ++n) {
                 S1 += M_ptr[fast_div(y, dy, n)];
             }
+#endif
 
             int64 S2 = eval_s2_single(y, A, mu_ptr);
             return 1 - S1 + kappa_y * static_cast<int64>(M_ptr[A]) - S2;
@@ -1050,7 +1121,10 @@ public:
             }
             }
 #endif
-            // Scalar 8-wide unrolled odd loop (local contribution, exact via fast_div)
+            // Packed x86 odd-quotient reads, or the scalar unrolled fallback.
+#if defined(MERTENS_SSE2_DIV)
+            S1_diff += sum_dense_quotients<2>(y, n, kappa_y, M_ptr);
+#else
             for (; n + 15 <= kappa_y; n += 16) {
                 S1_diff += M_ptr[fast_div(y, dy, n)]
                          + M_ptr[fast_div(y, dy, n + 2)]
@@ -1064,6 +1138,7 @@ public:
             for (; n <= kappa_y; n += 2) {
                 S1_diff += M_ptr[fast_div(y, dy, n)];
             }
+#endif
 
             // ---------------------------------------------------------------------------
             // Even-n correction: pure SIMD increments and vcvtq (+scalar unrolled fast_div)
@@ -1108,6 +1183,9 @@ public:
                 }
                 }
 #endif
+#if defined(MERTENS_SSE2_DIV)
+                S1_diff -= sum_dense_quotients<2>(y, ne, two_kappa_y2, M_ptr);
+#else
                 for (; ne + 15 <= two_kappa_y2; ne += 16) {
                     S1_diff -= (M_ptr[fast_div(y, dy, ne)]
                               + M_ptr[fast_div(y, dy, ne + 2)]
@@ -1121,6 +1199,7 @@ public:
                 for (; ne <= two_kappa_y2; ne += 2) {
                     S1_diff -= M_ptr[fast_div(y, dy, ne)];
                 }
+#endif
             } else if (two_kappa_y2 < kappa_y) {
                 int64 start_even = two_kappa_y2 + 1;
                 if (start_even % 2 != 0) ++start_even;
@@ -1161,6 +1240,9 @@ public:
                 }
                 }
 #endif
+#if defined(MERTENS_SSE2_DIV)
+                S1_diff += sum_dense_quotients<2>(y, ne, kappa_y, M_ptr);
+#else
                 for (; ne + 15 <= kappa_y; ne += 16) {
                     S1_diff += (M_ptr[fast_div(y, dy, ne)]
                               + M_ptr[fast_div(y, dy, ne + 2)]
@@ -1174,6 +1256,7 @@ public:
                 for (; ne <= kappa_y; ne += 2) {
                     S1_diff += M_ptr[fast_div(y, dy, ne)];
                 }
+#endif
             }
 
             int64 S2_diff = eval_s2_combined(y, A, B, mu_ptr);
@@ -1303,6 +1386,9 @@ public:
                 S1 += table.reconstruct_compressed(q);
             }
             int64 n = std::max(start_n, split_n + 1);
+#if defined(MERTENS_SSE2_DIV)
+            S1 += sum_dense_quotients<1>(y, n, kappa_y, M_dense);
+#else
             for (; n + 7 <= kappa_y; n += 8) {
                 S1 += M_dense[fast_div(y, dy, n)]
                     + M_dense[fast_div(y, dy, n + 1)]
@@ -1316,6 +1402,7 @@ public:
             for (; n <= kappa_y; ++n) {
                 S1 += M_dense[fast_div(y, dy, n)];
             }
+#endif
             int64 S2 = eval_s2_single(y, A, mu_ptr);
             return 1 - S1 + kappa_y * static_cast<int64>(M_dense[A]) - S2;
         };
@@ -1343,6 +1430,9 @@ public:
                 int64 q = fast_div(y, dy, n);
                 S1_diff += table.reconstruct_compressed(q);
             }
+#if defined(MERTENS_SSE2_DIV)
+            S1_diff += sum_dense_quotients<2>(y, n, kappa_y, M_dense);
+#else
             for (; n + 15 <= kappa_y; n += 16) {
                 S1_diff += M_dense[fast_div(y, dy, n)]
                          + M_dense[fast_div(y, dy, n + 2)]
@@ -1356,11 +1446,15 @@ public:
             for (; n <= kappa_y; n += 2) {
                 S1_diff += M_dense[fast_div(y, dy, n)];
             }
+#endif
 
             if (two_kappa_y2 > kappa_y) {
                 int64 start_even = kappa_y + 1;
                 if (start_even % 2 != 0) ++start_even;
                 int64 ne = start_even;
+#if defined(MERTENS_SSE2_DIV)
+                S1_diff -= sum_dense_quotients<2>(y, ne, two_kappa_y2, M_dense);
+#else
                 for (; ne + 15 <= two_kappa_y2; ne += 16) {
                     S1_diff -= (M_dense[fast_div(y, dy, ne)]
                               + M_dense[fast_div(y, dy, ne + 2)]
@@ -1374,10 +1468,14 @@ public:
                 for (; ne <= two_kappa_y2; ne += 2) {
                     S1_diff -= M_dense[fast_div(y, dy, ne)];
                 }
+#endif
             } else if (two_kappa_y2 < kappa_y) {
                 int64 start_even = two_kappa_y2 + 1;
                 if (start_even % 2 != 0) ++start_even;
                 int64 ne = start_even;
+#if defined(MERTENS_SSE2_DIV)
+                S1_diff += sum_dense_quotients<2>(y, ne, kappa_y, M_dense);
+#else
                 for (; ne + 15 <= kappa_y; ne += 16) {
                     S1_diff += (M_dense[fast_div(y, dy, ne)]
                               + M_dense[fast_div(y, dy, ne + 2)]
@@ -1391,6 +1489,7 @@ public:
                 for (; ne <= kappa_y; ne += 2) {
                     S1_diff += M_dense[fast_div(y, dy, ne)];
                 }
+#endif
             }
 
             int64 S2_diff = eval_s2_combined(y, A, B, mu_ptr);

@@ -14,7 +14,7 @@
 void print_usage(const char* prog) {
     std::cout << "Usage:" << std::endl;
     std::cout << "  " << prog << " <X> [threads]                   Evaluate M(X) at a single value" << std::endl;
-    std::cout << "  " << prog << " --benchmark [max_exp] [threads]  Run benchmark sweep up to 10^max_exp" << std::endl;
+    std::cout << "  " << prog << " --benchmark [max_exp] [threads] [repeats]  Run benchmark sweep (median time)" << std::endl;
     std::cout << "  " << prog << " --compare [max_exp] [threads]    Compare DP vs Deléglise-Rivat" << std::endl;
 }
 
@@ -32,18 +32,37 @@ int main(int argc, char* argv[]) {
         int max_exp = (argc >= 3) ? std::stoi(argv[2]) : 15;
         int threads = (argc >= 4) ? std::stoi(argv[3]) : 0;
 
+        int repeats = (argc >= 5) ? std::stoi(argv[4]) : 1;
+        if (repeats < 1) {
+            std::cerr << "Benchmark repeats must be positive." << std::endl;
+            return 1;
+        }
+
         std::cout << "========================================================================" << std::endl;
         std::cout << "      Deléglise-Rivat O(X^(2/3)) Mertens Benchmark Sweep (10^1..10^" << max_exp << ")  " << std::endl;
         std::cout << "========================================================================" << std::endl;
+        std::cout << "Median of " << repeats << " run(s) per input." << std::endl;
         std::cout << "| Power | Target X            | Exact M(X)         | Time (seconds)    |" << std::endl;
         std::cout << "| :---  | :---                | :---               | :---              |" << std::endl;
 
         int64 cur_X = 10;
         for (int exp = 1; exp <= max_exp; ++exp) {
-            auto t0 = std::chrono::high_resolution_clock::now();
-            int64 res = DelégliseRivatEngine::compute_mertens(cur_X, threads);
-            auto t1 = std::chrono::high_resolution_clock::now();
-            double elapsed = std::chrono::duration<double>(t1 - t0).count();
+            std::vector<double> samples;
+            samples.reserve(static_cast<size_t>(repeats));
+            int64 res = 0;
+            for (int repeat = 0; repeat < repeats; ++repeat) {
+                auto t0 = std::chrono::steady_clock::now();
+                int64 actual = DelégliseRivatEngine::compute_mertens(cur_X, threads);
+                auto t1 = std::chrono::steady_clock::now();
+                if (repeat > 0 && actual != res) {
+                    std::cerr << "Inconsistent M(" << cur_X << ") across benchmark runs." << std::endl;
+                    return 2;
+                }
+                res = actual;
+                samples.push_back(std::chrono::duration<double>(t1 - t0).count());
+            }
+            std::sort(samples.begin(), samples.end());
+            double elapsed = (samples[(samples.size() - 1) / 2] + samples[samples.size() / 2]) / 2;
 
             std::cout << "| 10^" << std::setw(2) << std::left << exp << " | "
                       << std::setw(19) << std::right << cur_X << " | "
