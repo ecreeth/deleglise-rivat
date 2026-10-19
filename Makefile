@@ -2,7 +2,7 @@ CXX := clang++
 CXXFLAGS := -O3 -std=c++20 -Wall -Wextra -march=native -funroll-loops
 OMP_FLAGS := -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include -L/opt/homebrew/opt/libomp/lib -lomp
 
-TARGETS := bench_dr test_dr
+TARGETS := bench_dr test_dr test_sieve
 CUDA_TARGETS := bench_cuda test_cuda
 
 # CUDA Configuration (Default: sm_75 for NVIDIA Tesla T4)
@@ -18,6 +18,9 @@ bench_dr: bench_dr.cpp mertens_dr.hpp
 test_dr: test_dr.cpp mertens_dr.hpp
 	$(CXX) $(CXXFLAGS) $(OMP_FLAGS) test_dr.cpp -o test_dr
 
+test_sieve: test_sieve.cpp mertens_dr.hpp
+	$(CXX) $(CXXFLAGS) $(OMP_FLAGS) test_sieve.cpp -o test_sieve
+
 cuda: $(CUDA_TARGETS)
 
 bench_cuda: bench_cuda.cu mertens_cuda.cuh mertens_dr.hpp
@@ -26,7 +29,8 @@ bench_cuda: bench_cuda.cu mertens_cuda.cuh mertens_dr.hpp
 test_cuda: test_cuda.cu mertens_cuda.cuh mertens_dr.hpp
 	$(NVCC) $(NVCCFLAGS) test_cuda.cu -o test_cuda
 
-test: test_dr
+test: test_dr test_sieve
+	./test_sieve
 	./test_dr
 
 test-cuda: test_cuda

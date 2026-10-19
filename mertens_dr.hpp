@@ -198,8 +198,9 @@ inline void sieve_mu_odd_byte_log(int8_t* __restrict__ mu_odd, int64 half_u, int
                 int64 start_i = (start_val - low_val) / 2;
 
                 for (int64 i = start_i; i < len; i += p) {
-                    int8_t a = b_mu[i];
-                    if ((a & 0x80) == 0) b_mu[i] = static_cast<int8_t>(a + w);
+                    // The square flag survives addition: all prime weights
+                    // together remain below 0x80 for the supported sieve range.
+                    b_mu[i] = static_cast<int8_t>(static_cast<uint8_t>(b_mu[i]) + w);
                 }
             }
 
@@ -221,6 +222,78 @@ inline void sieve_mu_odd_byte_log(int8_t* __restrict__ mu_odd, int64 half_u, int
     }
     mu_odd[0] = 0;
     if (half_u >= 1) mu_odd[1] = 1; // value 1 has no prime factors (acc=0 would give -1)
+}
+
+// Fixed logical partitions keep prefix offsets correct even when OpenMP
+// supplies fewer workers than requested (including dynamic/nested teams).
+inline void build_dense_prefix(int16_t* __restrict__ M_ptr,
+                               const int8_t* __restrict__ mu_odd_ptr,
+                               int64 m_limit, int threads) {
+    int num_t = threads;
+    std::vector<int32_t> block_sums(num_t + 1, 0);
+
+    #pragma omp parallel for schedule(static) num_threads(num_t)
+    for (int tid = 0; tid < num_t; ++tid) {
+        int64 chunk = (m_limit + num_t - 1) / num_t;
+        chunk = (chunk + 3) & ~3LL;
+        int64 start = tid * chunk + 1;
+        int64 end = std::min(m_limit, (tid + 1) * chunk);
+
+        int32_t local_sum = 0;
+        int64 i = start;
+        // mu(4k) = 0; sum each aligned group with three loads.
+        for (; i + 3 <= end; i += 4) {
+            int64 k = (i - 1) / 4;
+            local_sum += static_cast<int32_t>(mu_odd_ptr[2 * k + 1])
+                       - static_cast<int32_t>(mu_odd_ptr[k + 1])
+                       + static_cast<int32_t>(mu_odd_ptr[2 * k + 2]);
+        }
+        for (; i <= end; ++i) local_sum += mu_from_odd(i, mu_odd_ptr);
+        block_sums[tid + 1] = local_sum;
+    }
+
+    for (int i = 1; i <= num_t; ++i) {
+        block_sums[i] += block_sums[i - 1];
+    }
+
+    #pragma omp parallel for schedule(static) num_threads(num_t)
+    for (int tid = 0; tid < num_t; ++tid) {
+        int64 chunk = (m_limit + num_t - 1) / num_t;
+        chunk = (chunk + 3) & ~3LL;
+        int64 start = tid * chunk + 1;
+        int64 end = std::min(m_limit, (tid + 1) * chunk);
+
+        int32_t run_sum = block_sums[tid];
+        int64 i = start;
+        for (; i + 3 <= end; i += 4) {
+            int64 m = (i - 1) / 4;
+            int8_t m1 = mu_odd_ptr[2 * m + 1];
+            int8_t m2 = -mu_odd_ptr[m + 1];
+            int8_t m3 = mu_odd_ptr[2 * m + 2];
+            int16_t s0 = static_cast<int16_t>(run_sum += m1);
+            int16_t s1 = static_cast<int16_t>(run_sum += m2);
+            int16_t s2 = static_cast<int16_t>(run_sum += m3);
+            int16_t s3 = static_cast<int16_t>(run_sum);
+
+            uint64_t quad = (static_cast<uint16_t>(s0))
+                          | (static_cast<uint64_t>(static_cast<uint16_t>(s1)) << 16)
+                          | (static_cast<uint64_t>(static_cast<uint16_t>(s2)) << 32)
+                          | (static_cast<uint64_t>(static_cast<uint16_t>(s3)) << 48);
+            std::memcpy(&M_ptr[i], &quad, sizeof(quad));
+        }
+        for (; i <= end; ++i) {
+            int8_t m;
+            if (i & 1) {
+                m = mu_odd_ptr[(i + 1) >> 1];
+            } else if ((i >> 1) & 1) {
+                m = -mu_odd_ptr[((i >> 1) + 1) >> 1];
+            } else {
+                m = 0;
+            }
+            run_sum += m;
+            M_ptr[i] = static_cast<int16_t>(run_sum);
+        }
+    }
 }
 
 /**
@@ -304,78 +377,7 @@ private:
             mu_ptr[i] = m;
         }
 
-        // 4. Parallel direct prefix sum for M from mu_odd (zero mu array overhead)
-        // Windowed path sets m_limit=mu_limit to skip the 1.2GB full table.
-        int16_t* __restrict__ M_ptr = M.data();
-        int num_t = threads;
-        std::vector<int32_t> block_sums(num_t + 1, 0);
-
-        #pragma omp parallel num_threads(num_t)
-        {
-            int tid = omp_get_thread_num();
-            int64 chunk = (m_limit + num_t - 1) / num_t;
-            chunk = (chunk + 3) & ~3LL;
-            int64 start = tid * chunk + 1;
-            int64 end = std::min(m_limit, (tid + 1) * chunk);
-
-            int32_t local_sum = 0;
-            for (int64 i = start; i <= end; ++i) {
-                int8_t m;
-                if (i & 1) {
-                    m = mu_odd_ptr[(i + 1) >> 1];
-                } else if ((i >> 1) & 1) {
-                    m = -mu_odd_ptr[((i >> 1) + 1) >> 1];
-                } else {
-                    m = 0;
-                }
-                local_sum += m;
-            }
-            block_sums[tid + 1] = local_sum;
-        }
-
-        for (int i = 1; i <= num_t; ++i) {
-            block_sums[i] += block_sums[i - 1];
-        }
-
-        #pragma omp parallel num_threads(num_t)
-        {
-            int tid = omp_get_thread_num();
-            int64 chunk = (m_limit + num_t - 1) / num_t;
-            chunk = (chunk + 3) & ~3LL;
-            int64 start = tid * chunk + 1;
-            int64 end = std::min(m_limit, (tid + 1) * chunk);
-
-            int32_t run_sum = block_sums[tid];
-            int64 i = start;
-            for (; i + 3 <= end; i += 4) {
-                int64 m = (i - 1) / 4;
-                int8_t m1 = mu_odd_ptr[2 * m + 1];
-                int8_t m2 = -mu_odd_ptr[m + 1];
-                int8_t m3 = mu_odd_ptr[2 * m + 2];
-                int16_t s0 = static_cast<int16_t>(run_sum += m1);
-                int16_t s1 = static_cast<int16_t>(run_sum += m2);
-                int16_t s2 = static_cast<int16_t>(run_sum += m3);
-                int16_t s3 = static_cast<int16_t>(run_sum);
-
-                uint64_t quad = (static_cast<uint16_t>(s0))
-                              | (static_cast<uint64_t>(static_cast<uint16_t>(s1)) << 16)
-                              | (static_cast<uint64_t>(static_cast<uint16_t>(s2)) << 32)
-                              | (static_cast<uint64_t>(static_cast<uint16_t>(s3)) << 48);
-                std::memcpy(&M_ptr[i], &quad, sizeof(quad));
-            }
-            for (; i <= end; ++i) {
-                int8_t m;
-                if (i & 1) {
-                    m = mu_odd_ptr[(i + 1) >> 1];
-                } else if ((i >> 1) & 1) {
-                    m = -mu_odd_ptr[((i >> 1) + 1) >> 1];
-                } else {
-                    m = 0;
-                }
-                run_sum += m;
-                M_ptr[i] = static_cast<int16_t>(run_sum);
-            }
-        }
+        build_dense_prefix(M.data(), mu_odd_ptr, m_limit, threads);
 
         if (retain_mu_odd) {
             mu_odd_store = std::move(mu_odd);
@@ -682,45 +684,9 @@ private:
         sieve_mu_odd_byte_log(mu_odd.data(), half_u_total, u_total, threads);
         const int8_t* __restrict__ mu_odd_ptr = mu_odd.data();
 
-        // Phase 2: dense M prefix
+        // Phase 2: shared packed dense M prefix.
         dense_M.assign(static_cast<size_t>(u_dense + 1), 0);
-        {
-            int16_t* __restrict__ M_ptr = dense_M.data();
-            int num_t = threads;
-            std::vector<int32_t> block_sums(static_cast<size_t>(num_t + 1), 0);
-
-            #pragma omp parallel num_threads(num_t)
-            {
-                int tid = omp_get_thread_num();
-                int64 chunk_sz = (u_dense + num_t - 1) / num_t;
-                chunk_sz = (chunk_sz + 3) & ~3LL;
-                int64 start = tid * chunk_sz + 1;
-                int64 end = std::min(u_dense, (tid + 1) * chunk_sz);
-
-                int32_t local_sum = 0;
-                for (int64 i = start; i <= end; ++i) {
-                    local_sum += mu_from_odd(i, mu_odd_ptr);
-                }
-                block_sums[static_cast<size_t>(tid + 1)] = local_sum;
-            }
-            for (int i = 1; i <= num_t; ++i)
-                block_sums[static_cast<size_t>(i)] += block_sums[static_cast<size_t>(i - 1)];
-
-            #pragma omp parallel num_threads(num_t)
-            {
-                int tid = omp_get_thread_num();
-                int64 chunk_sz = (u_dense + num_t - 1) / num_t;
-                chunk_sz = (chunk_sz + 3) & ~3LL;
-                int64 start = tid * chunk_sz + 1;
-                int64 end = std::min(u_dense, (tid + 1) * chunk_sz);
-
-                int32_t run_sum = block_sums[static_cast<size_t>(tid)];
-                for (int64 i = start; i <= end; ++i) {
-                    run_sum += mu_from_odd(i, mu_odd_ptr);
-                    M_ptr[i] = static_cast<int16_t>(run_sum);
-                }
-            }
-        }
+        build_dense_prefix(dense_M.data(), mu_odd_ptr, u_dense, threads);
 
         // Phase 3: mu for S2
         mu.assign(static_cast<size_t>(mu_limit + 1), 0);
@@ -886,6 +852,19 @@ public:
                 run_sum += m;
             }
             return run_sum;
+        }
+
+        if (X <= 50000000LL) {
+            const int64 half = (X + 1) / 2;
+            std::vector<int8_t> mu_odd(static_cast<size_t>(half + 1));
+            sieve_mu_odd_byte_log(mu_odd.data(), half, X, threads);
+            // M(X) = sum_{odd n <= X} mu(n) - sum_{odd n <= X/2} mu(n).
+            // The common prefix cancels, leaving a contiguous suffix.
+            const int64 first = (X / 2 + 1) / 2 + 1;
+            int64 sum = 0;
+            #pragma omp parallel for reduction(+:sum) schedule(static) num_threads(threads)
+            for (int64 i = first; i <= half; ++i) sum += mu_odd[i];
+            return sum;
         }
 
         // Opt-in huge-X path: MERTENS_USE_CHMT=1 routes large X to the
