@@ -31,10 +31,17 @@
 #define MERTENS_NEON_DIV 1
 #endif
 
-// SSE2 is part of the x86-64 baseline; opt out for comparisons.
-#if (defined(_M_X64) || defined(__x86_64__)) && (!defined(MERTENS_USE_SSE2_DIV) || MERTENS_USE_SSE2_DIV)
+// SSE2 is part of the x86-64 baseline. Quotient division can be disabled
+// independently of the byte-sieve vector kernels.
+#if defined(_M_X64) || defined(__x86_64__)
 #include <emmintrin.h>
+#define MERTENS_HAVE_SSE2 1
+#if !defined(MERTENS_USE_SIMD_SIEVE) || MERTENS_USE_SIMD_SIEVE
+#define MERTENS_SIMD_SIEVE 1
+#endif
+#if !defined(MERTENS_USE_SSE2_DIV) || MERTENS_USE_SSE2_DIV
 #define MERTENS_SSE2_DIV 1
+#endif
 #endif
 
 namespace mertens_dr {
@@ -57,10 +64,13 @@ using uint128 = __uint128_t;
  */
 inline int64 isqrt(int64 n) noexcept {
     if (n <= 0) return 0;
-    int64 s = static_cast<int64>(std::sqrt(static_cast<double>(n)));
-    while ((s + 1) * (s + 1) <= n) ++s;
-    while (s * s > n) --s;
-    return s;
+    const uint64 target = static_cast<uint64>(n);
+    uint64 s = static_cast<uint64>(std::sqrt(static_cast<double>(n)));
+    // For signed 64-bit n, the candidate is below 2^32, so these unsigned
+    // squares fit even when the next square exceeds INT64_MAX.
+    while ((s + 1) * (s + 1) <= target) ++s;
+    while (s * s > target) --s;
+    return static_cast<int64>(s);
 }
 
 /**
@@ -130,6 +140,36 @@ inline int8_t mu_from_odd(int64 n, const int8_t* __restrict__ mu_odd) noexcept {
     }
 }
 
+// Entries represent consecutive values separated by Stride (1 or 2).
+// All entries between powers of two share one exact logarithmic threshold.
+template <int Stride>
+inline void finalize_mobius_bytes(uint8_t* values, int64 len, int64 first) noexcept {
+    static_assert(Stride == 1 || Stride == 2);
+    int64 i = 0;
+    while (i < len) {
+        const unsigned bits = std::bit_width(static_cast<uint64_t>(first + Stride * i));
+        const int64 stop = std::min<int64>(len, ((uint64_t(1) << bits) - first + Stride - 1) / Stride);
+#if defined(MERTENS_SIMD_SIEVE)
+        const __m128i ones = _mm_set1_epi8(1);
+        const __m128i threshold = _mm_set1_epi8(static_cast<char>(bits - 1));
+        const __m128i minus_one = _mm_set1_epi8(-1);
+        for (; i + 15 < stop; i += 16) {
+            const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(values + i));
+            const __m128i above = _mm_cmpgt_epi8(a, threshold);
+            const __m128i parity = _mm_and_si128(_mm_xor_si128(a, above), ones);
+            const __m128i value = _mm_add_epi8(minus_one, _mm_slli_epi16(parity, 1));
+            const __m128i valid = _mm_cmpgt_epi8(a, minus_one);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(values + i), _mm_and_si128(value, valid));
+        }
+#endif
+        for (; i < stop; ++i) {
+            const uint8_t a = values[i];
+            const int sign = (a & 1) ? -1 : 1;
+            values[i] = static_cast<uint8_t>((a & 0x80) ? 0 : (a > bits - 1 ? sign : -sign));
+        }
+    }
+}
+
 /**
  * Shared byte-log segmented Mobius sieve (Hurst 5.1/5.4 style, upstream winner).
  * Fills mu_odd[1..half_u] where mu_odd[k] = mu(2k-1). mu_odd must be
@@ -158,17 +198,12 @@ inline void sieve_mu_odd_byte_log(int8_t* __restrict__ mu_odd, int64 half_u, int
         }
     }
 
-    // 1b. Small-prime stencil (Hurst 5.2 style): pre-sieved odd weights for
-    // p in {3,5,7,11}. Weight divisibility has value-period lcm(3,5,7,11) =
-    // 1155; restricted to odd values the index period is 1155 entries
-    // (values 2j+1 share residues mod 3,5,7,11 iff j agrees mod 1155, since
-    // 2 is invertible mod 1155). Replaces the four densest weight loops.
-    // Square (p^2) marking stays per-prime for ALL primes: square periods
-    // (25, 49, 121, ...) do not divide any small value period, so folding
-    // flags into the stencil corrupts every block past the first. Flag
-    // dominates at finalize, so weights pre-added on squares are harmless.
+    // Period 17325 = lcm(3,5,7,11,9,25) in odd-table indices.
+    // This permits pre-marking the two densest odd square strides as well
+    // as weights for 3,5,7,11; every copied phase preserves all residues.
+    constexpr int64 STENCIL_SIZE = 17325;
     static const std::vector<int8_t> kOddStencil = []() {
-        constexpr int kLen = 1155;
+        constexpr int kLen = 17325;
         std::vector<int8_t> st(static_cast<size_t>(kLen), 0);
         const int small_p[4] = {3, 5, 7, 11};
         uint8_t small_w[4];
@@ -180,14 +215,15 @@ inline void sieve_mu_odd_byte_log(int8_t* __restrict__ mu_odd, int64 half_u, int
             for (int k = 0; k < 4; ++k) {
                 if (v % small_p[k] == 0) acc += small_w[k];
             }
+            if (v % 9 == 0 || v % 25 == 0) acc |= 0x80;
             st[static_cast<size_t>(j)] = static_cast<int8_t>(acc);
         }
         return st;
     }();
-    // First prime index >= 13 (primes[0..3] = 3,5,7,11 weights via stencil;
-    // their square loops still run below).
     size_t pi_start = 0;
     while (pi_start < primes.size() && primes[pi_start] < 13) ++pi_start;
+    size_t square_start = 0;
+    while (square_start < primes.size() && primes[square_start] < 7) ++square_start;
 
     const int64 BLOCK_SIZE = 131072; // 128K byte entries: L2-resident per thread
     int64 num_blocks = (half_u + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -204,14 +240,14 @@ inline void sieve_mu_odd_byte_log(int8_t* __restrict__ mu_odd, int64 half_u, int
             int8_t* __restrict__ b_mu = &mu_odd[low_idx];
             // Stencil fill with phase offset (replaces memset + p<=11 weights).
             {
-                int64 off = (low_idx - 1) % 1155;
+                int64 off = (low_idx - 1) % STENCIL_SIZE;
                 int64 done = 0;
-                int64 first = std::min<int64>(len, 1155 - off);
+                int64 first = std::min<int64>(len, STENCIL_SIZE - off);
                 std::memcpy(b_mu, kOddStencil.data() + off, static_cast<size_t>(first));
                 done = first;
-                while (done + 1155 <= len) {
-                    std::memcpy(b_mu + done, kOddStencil.data(), 1155);
-                    done += 1155;
+                while (done + STENCIL_SIZE <= len) {
+                    std::memcpy(b_mu + done, kOddStencil.data(), STENCIL_SIZE);
+                    done += STENCIL_SIZE;
                 }
                 if (done < len) {
                     std::memcpy(b_mu + done, kOddStencil.data(),
@@ -219,11 +255,11 @@ inline void sieve_mu_odd_byte_log(int8_t* __restrict__ mu_odd, int64 half_u, int
                 }
             }
 
-            // Square marking for ALL primes (square periods exceed the
-            // weight stencil period, so these stay strided).
-            for (size_t pi = 0; pi < primes.size(); ++pi) {
+            // Squares of 3 and 5 are already in the periodic stencil.
+            for (size_t pi = square_start; pi < primes.size(); ++pi) {
                 int64 p = primes[pi];
                 int64 p2 = p * p;
+                if (p2 > 2 * high_idx - 1) break;
                 int64 low_val = 2 * low_idx - 1;
 
                 int64 start_sq_val = ((low_val + p2 - 1) / p2) * p2;
@@ -252,20 +288,7 @@ inline void sieve_mu_odd_byte_log(int8_t* __restrict__ mu_odd, int64 half_u, int
                 }
             }
 
-            // In-cache finalize: log-sum -> mu via exact threshold compare.
-            for (int64 i = 0; i < len; ++i) {
-                int8_t a = b_mu[i];
-                int8_t m;
-                if (a & 0x80) {
-                    m = 0;
-                } else {
-                    uint64_t v = static_cast<uint64_t>(2 * (low_idx + i) - 1);
-                    unsigned f = std::bit_width(v) - 1; // floor(log2 v), v >= 1
-                    int8_t s = (a & 1) ? -1 : 1;
-                    m = (static_cast<unsigned>(a) > f) ? s : static_cast<int8_t>(-s);
-                }
-                b_mu[i] = m;
-            }
+            finalize_mobius_bytes<2>(reinterpret_cast<uint8_t*>(b_mu), len, 2 * low_idx - 1);
         }
     }
     mu_odd[0] = 0;
@@ -637,15 +660,11 @@ inline int64 eval_s2_single(int64 y, int64 A, const int8_t* __restrict mu_ptr) n
 }
 
 // ---------------------------------------------------------------------------
-// Compressed Hierarchical Mertens Table (CHMT) — optional huge-X path (local).
-// Rebuilt on top of the shared upstream byte-log sieve (no rem[], no UDIV,
-// int64-safe to 8B). Two-tier M(n):
-//   Tier 1 (Dense):      int16_t M[0..u_dense] — direct O(1)
-//   Tier 2 (Compressed): 2-bit mu deltas + int32 checkpoints — popcount O(1)
-// Encoding per n: nonzero=(mu!=0), sign=(mu<0); M(q)=checkpoint+pos-neg.
-// Each 256-value chunk = 32B/plane = 64B = 1 cacheline.
-// Default engine stays dense+windowed (low RAM); use compute_compressed /
-// MERTENS_USE_CHMT=1 only when outer-term reduction (N=X/u) dominates.
+// Streaming compressed Mertens table. Each 256-value chunk stores two
+// 32-byte Mobius bit planes plus four int32 checkpoints (one per 64 values).
+// A query needs one checkpoint, two word loads, and two popcounts. The
+// compressed tier uses 80/256 = 0.3125 bytes per integer, plus a dense prefix.
+// Construction uses cache-sized per-worker buffers, with no full odd sieve.
 // ---------------------------------------------------------------------------
 
 struct alignas(64) BitChunk {
@@ -665,7 +684,7 @@ public:
     int64 compressed_size;
     int64 num_chunks;
     std::vector<BitChunk> chunks;
-    std::vector<int32_t> checkpoints;
+    std::vector<int32_t> checkpoints; // M immediately before each 64-value word
 
     CompressedMertensTable(int64 total_limit, int64 dense_limit,
                            int num_threads = 0, int64 max_mu = 0)
@@ -679,7 +698,7 @@ public:
 #endif
         );
 
-        mu_limit = (max_mu > 0 ? max_mu : u_dense);
+        mu_limit = std::min(u_total, (max_mu > 0 ? max_mu : u_dense));
         compressed_size = std::max<int64>(0, u_total - u_dense);
         num_chunks = (compressed_size > 0 ? (compressed_size + 255) / 256 : 0);
         build(threads);
@@ -701,117 +720,186 @@ public:
     }
 
     inline void prefetch_M(int64 q) const noexcept {
+        auto prefetch = [](const void* address) noexcept {
+#if defined(MERTENS_HAVE_SSE2)
+            _mm_prefetch(static_cast<const char*>(address), _MM_HINT_NTA);
+#elif !defined(_MSC_VER)
+            __builtin_prefetch(address, 0, 0);
+#else
+            (void)address;
+#endif
+        };
         if (q <= u_dense) {
-            __builtin_prefetch(&dense_M[static_cast<size_t>(q)], 0, 0);
+            prefetch(&dense_M[static_cast<size_t>(q)]);
         } else if (q <= u_total) {
-            int64 ci = (q - u_dense - 1) >> 8;
-            __builtin_prefetch(&chunks[static_cast<size_t>(ci)], 0, 0);
-            __builtin_prefetch(&checkpoints[static_cast<size_t>(ci)], 0, 0);
+            const int64 offset = q - u_dense - 1;
+            prefetch(&chunks[static_cast<size_t>(offset >> 8)]);
+            prefetch(&checkpoints[static_cast<size_t>(offset >> 6)]);
         }
     }
 
     inline int32_t reconstruct_compressed(int64 q) const noexcept {
-        int64 offset = q - u_dense;
-        int64 ci = (offset - 1) >> 8;
-        int r = static_cast<int>((offset - 1) & 255) + 1;
-
-        int32_t base = checkpoints[static_cast<size_t>(ci)];
-        const BitChunk& chunk = chunks[static_cast<size_t>(ci)];
-
-        const uint64_t* nz64 = reinterpret_cast<const uint64_t*>(chunk.nonzero);
-        const uint64_t* sg64 = reinterpret_cast<const uint64_t*>(chunk.sign);
-
-        int full_words = r >> 6;
-        int rem_bits = r & 63;
-
-        int pos = 0, neg = 0;
-        for (int w = 0; w < full_words; ++w) {
-            uint64_t nz = nz64[w];
-            uint64_t sg = sg64[w];
-            pos += __builtin_popcountll(nz & ~sg);
-            neg += __builtin_popcountll(nz & sg);
-        }
-        if (rem_bits > 0) {
-            uint64_t mask = (rem_bits == 64) ? ~0ULL : ((1ULL << rem_bits) - 1ULL);
-            uint64_t nz = nz64[full_words] & mask;
-            uint64_t sg = sg64[full_words] & mask;
-            pos += __builtin_popcountll(nz & ~sg);
-            neg += __builtin_popcountll(nz & sg);
-        }
-
-        return base + pos - neg;
+        const int64 offset = q - u_dense - 1;
+        const int64 word = offset >> 6;
+        const BitChunk& chunk = chunks[static_cast<size_t>(word >> 2)];
+        const size_t byte = static_cast<size_t>((word & 3) * 8);
+        uint64_t nz, negative;
+        std::memcpy(&nz, chunk.nonzero + byte, sizeof(nz));
+        std::memcpy(&negative, chunk.sign + byte, sizeof(negative));
+        const uint64_t mask = ~uint64_t(0) >> (63 - (offset & 63));
+        return checkpoints[static_cast<size_t>(word)]
+             + std::popcount(nz & mask) - 2 * std::popcount(negative & mask);
     }
 
 private:
     void build(int threads) {
-        int64 half_u_total = (u_total + 1) / 2;
-        std::vector<int8_t> mu_odd(static_cast<size_t>(half_u_total + 64), 0);
-        // Shared upstream sieve: division-free, int64-safe (fixes local
-        // int-overflow segfault at u>2.1e9 and lg/is_zero extra traffic).
-        sieve_mu_odd_byte_log(mu_odd.data(), half_u_total, u_total, threads);
-        const int8_t* __restrict__ mu_odd_ptr = mu_odd.data();
-
-        // Phase 2: shared packed dense M prefix.
+        if (num_chunks == 0) {
+            SieveTable table(u_total, threads, mu_limit);
+            dense_M = std::move(table.M);
+            mu = std::move(table.mu);
+            return;
+        }
+        // Dense and compressed runs have separate logical partitions so an
+        // arbitrary dense boundary never splits a compressed 256-value chunk.
+        constexpr int64 BLOCK = 131072;
+        const int64 dense_blocks = (u_dense + BLOCK - 1) / BLOCK;
+        const int64 compressed_blocks = (compressed_size + BLOCK - 1) / BLOCK;
+        const int64 num_blocks = dense_blocks + compressed_blocks;
         dense_M.assign(static_cast<size_t>(u_dense + 1), 0);
-        build_dense_prefix(dense_M.data(), mu_odd_ptr, u_dense, threads);
-
-        // Phase 3: mu for S2
         mu.assign(static_cast<size_t>(mu_limit + 1), 0);
+        chunks.resize(static_cast<size_t>(num_chunks));
+        checkpoints.resize(static_cast<size_t>(num_chunks * 4));
+        std::vector<int32_t> block_sums(static_cast<size_t>(num_blocks + 1));
+
+        const int64 root = isqrt(u_total);
+        std::vector<uint8_t> prime_flags(static_cast<size_t>(root + 1), 1);
+        std::vector<int64> primes;
+        std::vector<uint8_t> weights;
+        for (int64 p = 2; p <= root; ++p) {
+            if (!prime_flags[static_cast<size_t>(p)]) continue;
+            primes.push_back(p);
+            weights.push_back(static_cast<uint8_t>(std::bit_width(static_cast<uint64_t>(p - 1)) | 1u));
+            for (int64 n = p * p; n <= root; n += p) prime_flags[static_cast<size_t>(n)] = 0;
+        }
+        // lcm(2,3,5,7,11,4,9) preserves both weights and square flags.
+        static const auto stencil = [] {
+            std::vector<uint8_t> values(13860);
+            for (int n = 1; n <= 13860; ++n) {
+                for (unsigned p : {2u, 3u, 5u, 7u, 11u})
+                    if (n % p == 0) values[n - 1] += static_cast<uint8_t>(std::bit_width(p - 1) | 1u);
+                if (n % 4 == 0 || n % 9 == 0) values[n - 1] |= 0x80;
+            }
+            return values;
+        }();
+        size_t first_square = 0;
+        while (first_square < primes.size() && primes[first_square] < 5) ++first_square;
+        size_t first_weight = 0;
+        while (first_weight < primes.size() && primes[first_weight] < 13) ++first_weight;
+
+        // Allocate scratch on the calling thread so allocation failures can
+        // propagate normally instead of escaping an OpenMP worker region.
+        std::vector<uint8_t> scratch(static_cast<size_t>(threads) * static_cast<size_t>(BLOCK));
+        #pragma omp parallel num_threads(threads)
         {
-            int8_t* __restrict__ mu_ptr = mu.data();
-            for (int64 i = 1; i <= mu_limit; ++i) {
-                mu_ptr[i] = mu_from_odd(i, mu_odd_ptr);
+#ifdef _OPENMP
+            const int worker = omp_get_thread_num();
+#else
+            const int worker = 0;
+#endif
+            uint8_t* buffer = scratch.data() + static_cast<size_t>(worker) * static_cast<size_t>(BLOCK);
+            #pragma omp for schedule(dynamic, 1)
+            for (int64 block = 0; block < num_blocks; ++block) {
+                const bool dense = block < dense_blocks;
+                const int64 base = dense ? block * BLOCK : u_dense + (block - dense_blocks) * BLOCK;
+                const int64 end = std::min(base + BLOCK, dense ? u_dense : u_total);
+                const int64 len = end - base;
+                const int64 low = base + 1;
+                int64 done = 0;
+                while (done < len) {
+                    const size_t phase = static_cast<size_t>((base + done) % 13860);
+                    const size_t count = static_cast<size_t>(std::min<int64>(len - done, 13860 - phase));
+                    std::memcpy(buffer + done, stencil.data() + phase, count);
+                    done += static_cast<int64>(count);
+                }
+                for (size_t pi = first_square; pi < primes.size(); ++pi) {
+                    const int64 square = primes[pi] * primes[pi];
+                    if (square > end) break;
+                    const int64 first = ((low + square - 1) / square) * square - low;
+                    for (int64 i = first; i < len; i += square) buffer[i] |= 0x80;
+                }
+                for (size_t pi = first_weight; pi < primes.size(); ++pi) {
+                    const int64 p = primes[pi];
+                    const uint8_t weight = weights[pi];
+                    const int64 first = ((low + p - 1) / p) * p - low;
+                    for (int64 i = first; i < len; i += p) buffer[i] += weight;
+                }
+                finalize_mobius_bytes<1>(buffer, len, low);
+                // The log threshold needs explicit values for 1 and 2.
+                if (base == 0) buffer[0] = 1;
+                if (low <= 2 && end >= 2) buffer[static_cast<size_t>(2 - low)] = 255;
+                if (base < mu_limit) {
+                    const size_t count = static_cast<size_t>(std::min(end, mu_limit) - base);
+                    std::memcpy(mu.data() + low, buffer, count);
+                }
+                const int8_t* values = reinterpret_cast<const int8_t*>(buffer);
+                int32_t sum = 0;
+                if (dense) {
+                    for (int64 n = 0; n < len; ++n) {
+                        sum += values[n];
+                        dense_M[static_cast<size_t>(low + n)] = static_cast<int16_t>(sum);
+                    }
+                } else {
+                    for (int64 off = 0; off < len; off += 256) {
+                        const int64 ci = (base - u_dense + off) / 256;
+                        BitChunk& chunk = chunks[static_cast<size_t>(ci)];
+                        std::memset(&chunk, 0, sizeof(chunk));
+                        const int64 count = std::min<int64>(256, len - off);
+                        int64 n = 0;
+#if defined(MERTENS_SIMD_SIEVE)
+                        const __m128i zero = _mm_setzero_si128();
+                        const __m128i ones = _mm_set1_epi8(1);
+                        for (; n + 15 < count; n += 16) {
+                            if ((n & 63) == 0) checkpoints[static_cast<size_t>(ci * 4 + n / 64)] = sum;
+                            const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(values + off + n));
+                            const uint16_t nonzero = static_cast<uint16_t>(~_mm_movemask_epi8(_mm_cmpeq_epi8(v, zero)));
+                            const uint16_t negative = static_cast<uint16_t>(_mm_movemask_epi8(v));
+                            std::memcpy(chunk.nonzero + n / 8, &nonzero, sizeof(nonzero));
+                            std::memcpy(chunk.sign + n / 8, &negative, sizeof(negative));
+                            const __m128i totals = _mm_sad_epu8(_mm_add_epi8(v, ones), zero);
+                            sum += _mm_cvtsi128_si32(totals) + _mm_cvtsi128_si32(_mm_srli_si128(totals, 8)) - 16;
+                        }
+#endif
+                        for (; n < count; ++n) {
+                            if ((n & 63) == 0) checkpoints[static_cast<size_t>(ci * 4 + n / 64)] = sum;
+                            const int8_t v = values[off + n];
+                            chunk.nonzero[n / 8] |= static_cast<uint8_t>((v != 0) << (n & 7));
+                            chunk.sign[n / 8] |= static_cast<uint8_t>((v < 0) << (n & 7));
+                            sum += v;
+                        }
+                    }
+                }
+                block_sums[static_cast<size_t>(block + 1)] = sum;
             }
         }
-
-        // Phase 4: compressed tier (branchless 8-element packing;
-        // mu(4k)=0 so only 6 live values per 8, bits 3,7 skipped)
-        if (num_chunks > 0) {
-            chunks.resize(static_cast<size_t>(num_chunks));
-            checkpoints.resize(static_cast<size_t>(num_chunks));
-            std::vector<int32_t> local_sums(static_cast<size_t>(num_chunks), 0);
-
-            #pragma omp parallel for schedule(static, 256) num_threads(threads)
-            for (int64 ci = 0; ci < num_chunks; ++ci) {
-                BitChunk& ch = chunks[static_cast<size_t>(ci)];
-                int32_t lsum = 0;
-                int64 k_base = (u_dense + ci * 256) >> 3;
-
-                for (int b = 0; b < 32; ++b) {
-                    int64 k = k_base + b;
-                    int64 idx4 = (k << 2) + 1;
-                    int64 idx2 = (k << 1) + 1;
-
-                    int8_t v1 = mu_odd_ptr[idx4];
-                    int8_t v2 = static_cast<int8_t>(-mu_odd_ptr[idx2]);
-                    int8_t v3 = mu_odd_ptr[idx4 + 1];
-                    int8_t v5 = mu_odd_ptr[idx4 + 2];
-                    int8_t v6 = static_cast<int8_t>(-mu_odd_ptr[idx2 + 1]);
-                    int8_t v7 = mu_odd_ptr[idx4 + 3];
-
-                    uint8_t nz = static_cast<uint8_t>(
-                        (v1 != 0) | ((v2 != 0) << 1) | ((v3 != 0) << 2) |
-                        ((v5 != 0) << 4) | ((v6 != 0) << 5) | ((v7 != 0) << 6)
-                    );
-                    uint8_t sg = static_cast<uint8_t>(
-                        (v1 < 0) | ((v2 < 0) << 1) | ((v3 < 0) << 2) |
-                        ((v5 < 0) << 4) | ((v6 < 0) << 5) | ((v7 < 0) << 6)
-                    );
-
-                    ch.nonzero[b] = nz;
-                    ch.sign[b] = sg;
-                    lsum += (v1 + v2 + v3 + v5 + v6 + v7);
-                }
-                local_sums[static_cast<size_t>(ci)] = lsum;
-            }
-
-            checkpoints[0] = static_cast<int32_t>(dense_M[static_cast<size_t>(u_dense)]);
-            for (int64 ci = 1; ci < num_chunks; ++ci) {
-                checkpoints[static_cast<size_t>(ci)] =
-                    checkpoints[static_cast<size_t>(ci - 1)] + local_sums[static_cast<size_t>(ci - 1)];
+        // Convert local prefixes/checkpoints to global Mertens values.
+        for (int64 b = 1; b <= num_blocks; ++b)
+            block_sums[static_cast<size_t>(b)] += block_sums[static_cast<size_t>(b - 1)];
+        #pragma omp parallel for schedule(static) num_threads(threads)
+        for (int64 b = 0; b < num_blocks; ++b) {
+            const int32_t offset = block_sums[static_cast<size_t>(b)];
+            if (b < dense_blocks) {
+                const int64 base = b * BLOCK;
+                const int64 end = std::min(base + BLOCK, u_dense);
+                for (int64 n = base + 1; n <= end; ++n)
+                    dense_M[static_cast<size_t>(n)] = static_cast<int16_t>(dense_M[static_cast<size_t>(n)] + offset);
+            } else {
+                const int64 first_word = (b - dense_blocks) * (BLOCK / 64);
+                const int64 last_word = std::min(first_word + BLOCK / 64, (compressed_size + 63) / 64);
+                for (int64 w = first_word; w < last_word; ++w) checkpoints[static_cast<size_t>(w)] += offset;
             }
         }
     }
+
 };
 
 /**
@@ -934,9 +1022,11 @@ public:
             return sum;
         }
 
-        // Opt-in huge-X path: MERTENS_USE_CHMT=1 routes large X to the
-        // compressed table (local). Default stays dense+windowed (upstream).
-        if (X >= COMPRESSED_THRESHOLD && use_chmt_env()) {
+        // Use the streaming table for large x86 inputs. Explicit dense
+        // tuning preserves the dense path; MERTENS_USE_CHMT overrides it.
+        const bool compressed = std::getenv("MERTENS_USE_CHMT")
+                              ? use_chmt_env() : use_compressed_default(X);
+        if (X >= COMPRESSED_THRESHOLD && compressed) {
             return compute_compressed(X, threads);
         }
 
@@ -1293,13 +1383,12 @@ public:
     }
 
     /**
-     * CHMT tuning (local, optional huge-X path).
-     * Default engine uses choose_sieve_limit (fx=0.32, cap 1.5G, low RAM).
-     * CHMT scales u to 8B via 2-bit compression to cut N=X/u when outer
-     * terms dominate. Enable via MERTENS_USE_CHMT=1 or compute_compressed().
+     * Large-input streaming strategy. The dense prefix stays small while
+     * the compressed tier raises u, reducing the outer summation X/u.
+     * x86 defaults to this path from 1e11; MERTENS_USE_CHMT=0 forces dense.
      */
-    static constexpr int64 COMPRESSED_THRESHOLD = 1000000000000000LL; // 10^15
-    static constexpr int64 DENSE_LIMIT = 600000000LL; // 600M
+    static constexpr int64 COMPRESSED_THRESHOLD = 100000000000LL; // 10^11
+    static constexpr int64 DENSE_LIMIT = 128000000LL; // dense prefix target
 
     static inline double choose_cx_compressed(int64 X) noexcept {
         (void)X;
@@ -1319,7 +1408,23 @@ public:
         int64 S = isqrt(X);
         if (u < 3 * S) u = 3 * S;
         u = ((u + 255) / 256) * 256;
-        return std::min(u, 8000000000LL);
+        int64 cap = 8000000000LL;
+        if (const char* value = std::getenv("MERTENS_CHMT_U_CAP")) {
+            const int64 requested = std::atoll(value);
+            if (requested >= 100000000LL && requested <= 10000000000LL) cap = requested;
+        }
+        const int64 endpoints = static_cast<int64>(choose_cx(X) * std::sqrt(static_cast<double>(X))) + 1000;
+        cap = std::max(cap, std::max(S + 1000, endpoints));
+        return std::min(u, cap);
+    }
+
+    static bool use_compressed_default(int64 X) noexcept {
+#if defined(MERTENS_HAVE_SSE2)
+        return X >= COMPRESSED_THRESHOLD && !std::getenv("MERTENS_FX") && !std::getenv("MERTENS_U_CAP");
+#else
+        (void)X;
+        return false;
+#endif
     }
 
     static bool use_chmt_env() noexcept {
@@ -1330,13 +1435,24 @@ public:
     }
 
     /**
-     * Compressed-table computation path (CHMT, opt-in for X>=1e15).
-     * Uses two-tier M table with popcount reconstruction + 8-way unrolled S1.
-     * S2 uses the merged run_s2_fast (tail-clamp + fast_div exact).
+     * Streamed compressed-table computation, also callable explicitly.
+     * The dense prefix includes every A/B endpoint; larger quotients use
+     * two-popcount reconstruction. S2 keeps the exact SIMD/scalar kernels.
      */
     static int64 compute_compressed(int64 X, int threads) {
+        if (X <= 100000LL) return compute_mertens(X, threads);
+        if (threads <= 0) {
+#ifdef _OPENMP
+            threads = omp_get_max_threads();
+#else
+            threads = 1;
+#endif
+        }
         int64 u_total = choose_compressed_limit(X);
-        int64 u_dense = std::min(u_total, DENSE_LIMIT);
+        int64 endpoint_limit = static_cast<int64>(choose_cx(X) * std::sqrt(static_cast<double>(X))) + 1000;
+        endpoint_limit = (endpoint_limit + 255) & ~255LL;
+        const int64 dense_target = std::min(DENSE_LIMIT, ((u_total / 4 + 255) & ~255LL));
+        int64 u_dense = std::min(u_total, std::max(dense_target, endpoint_limit));
         // Upstream cx by default; set MERTENS_CX=1.5 to reproduce local tuning.
         const double cx = choose_cx(X);
         const int64 N = X / u_total;
@@ -1380,7 +1496,8 @@ public:
             int64 start_n = y / u_total + 1;
             double dy = static_cast<double>(y);
 
-            int64 split_n = std::min(kappa_y, (u_dense > 0 ? y / u_dense : kappa_y));
+            // floor(y/n) > u_dense iff n <= floor(y/(u_dense+1)).
+            int64 split_n = std::min(kappa_y, y / (u_dense + 1));
             for (int64 n = start_n; n <= split_n; ++n) {
                 int64 q = fast_div(y, dy, n);
                 S1 += table.reconstruct_compressed(q);
@@ -1424,7 +1541,7 @@ public:
             if (start_odd % 2 == 0) ++start_odd;
             double dy = static_cast<double>(y);
 
-            int64 split_odd = std::min(kappa_y, (u_dense > 0 ? y / u_dense : kappa_y));
+            int64 split_odd = std::min(kappa_y, y / (u_dense + 1));
             int64 n = start_odd;
             for (; n <= split_odd; n += 2) {
                 int64 q = fast_div(y, dy, n);

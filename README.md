@@ -7,28 +7,41 @@ Based on and extending the mathematical framework described in Greg Hurst's prep
 
 ---
 
-## Key Features & Optimizations
+## CPU Strategies and Optimizations
 
-1. **Inclusion–Exclusion Reductions:**
-   - **Outer Parity Split & Mod-6 Wheel Reduction:** Evaluates $S(y, u) - S(y/2, u) - S(y/3, u) + S(y/6, u)$ across square-free $k$ coprime to 6, cutting outer terms by $>69\%$.
-   - **$S_1$ Parity Cancellation:** Cancels even quotient lookups across surviving odd/even intervals (stride-2 queries).
-   - **$S_2$ Piecewise Reduction:** Partitions $j \le A, (j, 6)=1$ into 8 exact branchless arithmetic intervals.
+- **Small inputs:** a linear odd sieve handles `X <= 100000`. Through 50 million,
+  the segmented odd sieve returns the required suffix sum without allocating a
+  full Mertens prefix table.
+- **Dense Deléglise-Rivat:** medium inputs use the mod-6 outer reduction,
+  piecewise S2 sums, parity cancellation in S1, and direct 16-bit Mertens lookups.
+- **Streaming compressed table:** x86-64 selects this strategy from `10^11`.
+  It raises the sieve cutoff to as much as **8 billion**, reducing the number
+  of outer terms. The dense prefix targets the smaller of 128 million entries
+  and one quarter of the cutoff, expanding to include every A/B endpoint. Each compressed 256-value chunk has
+  two 32-byte Mobius bit planes and four 32-bit checkpoints: **0.3125 bytes per
+  compressed entry**, with two popcounts per lookup. Construction uses 128 KiB
+  buffers per worker, without retaining a full temporary odd sieve.
+- **Vectorized sieving and quotient loops:** x86-64 finalizes 16 byte-log sieve
+  entries at once. Phase-correct stencils pre-mark the densest prime weights
+  and square factors. SSE2 quotient loops retain exact integer division above
+  `2^53`; other architectures retain scalar/optional NEON quotient backends.
+- **Parallel prefixes:** logical blocks keep prefix offsets correct when
+  OpenMP supplies fewer workers than requested, including nested teams.
 
-2. **Compressed Hierarchical Mertens Table (CHMT) Algorithm (Unified Engine for all $X > 10^5$):**
-   - **Seamless Multi-Tier Scaling:** Dynamically sizes `u_dense = std::min(u_total, 600M)`. For $X \le 10^{14}$ ($u \le 600\text{M}$), it operates as a 100% dense table with 0 compressed chunks (zero overhead). For massive $X \ge 10^{15}$, it seamlessly engages Tier 2 (2-bit bit-plane chunks), scaling $u$ up to **8 Billion entries** in ~3.1 GB RAM.
-   - **13.3× Outer Term Reduction:** Slashes the outer summation workload for $10^{16}$ from 16.7 million terms down to 1.25 million terms ($N = X / u$).
-   - **Constant-Time Hardware Popcount Reconstruction:** Evaluates $M(q)$ in single-digit CPU clock cycles via 4 branchless 64-bit hardware popcount instructions (`__builtin_popcountll(nz & ~sg)` and `__builtin_popcountll(nz & sg)`), requiring zero memory decompression.
-   - **Branchless 8-Element Bit-Plane Packing:** Exploits $\mu(8k+4)=\mu(8k+8)=0$ and $\mu(8k+2)=-\mu_{\text{odd}}[2k+1]$ to pack 8 numbers per iteration directly from odd sieve bytes, achieving a **13× speedup** in table compression.
-   - **Compile-Time Reciprocal Prime Sieving:** Replaces runtime 8-cycle `UDIV` instructions for small primes ($p \in \{3, 5, \dots, 71\}$) with 1-cycle `UMULH` compile-time fixed-point reciprocals (`sieve_prime_const<P>`).
-   - **Two-Tier $S_1$ Execution Engine:** Resolves initial large quotients via compressed popcount reconstruction and the remaining 99.9% of quotients ($q \le u_{\text{dense}}$) through an 8-way unrolled direct read from `M_dense`.
+Strategy and tuning controls:
 
-3. **Micro-Architectural & SIMD Acceleration:**
-   - **Zero-Allocation Compact Sieve (`FastSieve`):** Generates $M(n)$ prefix sums directly from odd-sieved segments via sequential 64-bit quad writes (`int16_t` quads), capping the $\mu$ table allocation to $<40\text{ MB}$ ($A_{\max}$) instead of $u$ (600 MB) and saving $>1.2\text{ GB}$ of DRAM traffic.
-   - **4-Way Pipelined NEON $S_2$ Runner:** Unrolled 4-way (8 coprime-to-6 values per iteration), maintaining $j$ strictly in SIMD registers with vector step increments (`vaddq_f64`), pipelining 4 `vdivq_f64` instructions, and using `vcvtq_s64_f64` hardware conversions.
-   - **Pure SIMD $S_1$ and Even-$n$ Correction:** Eliminates division overhead from software prefetching and evaluates $S_1$ arithmetic with SIMD vector additions and hardware integer truncation.
-   - **Unified Dynamic Parallel Dispatch:** Merges all 4 OpenMP ranges into a single unified term vector with dynamic chunk scheduling (`schedule(dynamic, 8)`), eliminating barrier syncs and fixing thread starvation on small $k$.
-   - **Flat 16-Bit Cache (`int16_t`):** Uses single-cycle `ldrh` lookups without multi-level cache table indirections.
-   - **Dynamic Hardware-Aware $c_x(X)$ Tuning:** Automatically balances $S_1$ memory traffic and $S_2$ streaming throughput ($c_x = 0.95$ for $10^{15..16}$, $0.95$ for $10^{11..14}$, $0.70$ for $X \le 10^{10}$).
+| Setting | Behavior |
+|---|---|
+| `MERTENS_USE_CHMT` unset | Automatic streaming strategy from `10^11` on x86-64; dense elsewhere. |
+| `MERTENS_USE_CHMT=0` | Force the dense strategy. |
+| `MERTENS_USE_CHMT=1` | Select streaming compression for inputs from `10^11`, including other architectures. |
+| `MERTENS_CHMT_U_CAP` | Set the compressed cutoff target (100 million to 10 billion); default is 8 billion. For example, `4000000000` reduces memory. The cutoff must still cover the algorithm's endpoints. |
+| `MERTENS_FX`, `MERTENS_U_CAP` | Preserve explicit dense tuning and disable automatic compression, unless CHMT is explicitly enabled. |
+| `MERTENS_CX` | Override the S1/S2 split parameter for either strategy. |
+
+Define `MERTENS_USE_SSE2_DIV=0` to compare scalar quotient loops, or
+`MERTENS_USE_SIMD_SIEVE=0` to compare scalar sieve finalization and packing.
+These compiler controls leave the numerical result unchanged.
 
 ---
 
@@ -37,10 +50,19 @@ Based on and extending the mathematical framework described in Greg Hurst's prep
 ### Prerequisites
 - Clang / GCC supporting C++20
 - OpenMP (`libomp` via Homebrew on macOS: `brew install libomp`)
+- Native Windows builds can use MSVC 2022 with C++20 and OpenMP.
 
 ### Compilation
 ```bash
 make
+```
+
+From an x64 Visual Studio Developer Command Prompt on Windows:
+
+```bat
+cl /O2 /std:c++20 /utf-8 /openmp /EHsc bench_dr.cpp /Fe:bench_dr.exe
+cl /O2 /std:c++20 /utf-8 /openmp /EHsc test_dr.cpp /Fe:test_dr.exe
+cl /O2 /std:c++20 /utf-8 /openmp /EHsc test_sieve.cpp /Fe:test_sieve.exe
 ```
 
 ### Running Unit Tests
@@ -65,17 +87,11 @@ make test
 ./bench_dr --compare 14 8
 ```
 
-On x86-64, the CPU engine uses packed SSE2 division for the S1 and S2
-quotient loops. This requires no extra architecture compiler flag. Define
-`MERTENS_USE_SSE2_DIV=0` to compare with the scalar backend. The dense lookup
-loop retains a scalar fallback for quotients beyond the signed 32-bit index
-range, and numerators above `2^53` retain exact integer division. Other
-architectures keep their existing scalar or optional NEON backend.
-
-Speedup varies by input: small inputs use a direct sieve, while larger inputs
-spend more time in quotient lookups and eventually reach the sieve memory cap.
+Speedup varies with input size, table footprint, and the selected strategy.
 Compare repeated runs with the same compiler, thread count, and tuning settings.
-See the [x86-64 comparison and measurement method](benchmarks/cpu-2026-10-19.md).
+The [streaming-table comparison](benchmarks/streaming-2026-10-19.md) measures
+this update against commit `edeb00d`. The [earlier SSE2 comparison](benchmarks/cpu-2026-10-19.md)
+records the preceding optimization.
 
 ---
 
@@ -117,7 +133,7 @@ make test-cuda
 
 ### CPU Performance & Comparison vs. Greg Hurst (arXiv:2607.07566)
 
-Measured 2026-09-20 on Apple M1 Mac mini (8T, 16GB) with the current engine
+Historical measurements from 2026-09-20 on Apple M1 Mac mini (8T, 16GB), before the streaming-table update, used the engine
 (scalar double-division quotient loops by default with opt-in NEON via
 `MERTENS_USE_NEON_DIV`, small-prime `{3,5,7,11}` sieve stencil, tunable
 OpenMP chunk `MERTENS_DYN_CHUNK=64`). `MERTENS_FX`/`MERTENS_CX` env overrides
